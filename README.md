@@ -65,9 +65,3 @@ Every key (except POV, which is always a hard cut) can be set to `smooth`, `line
 
 - Named projects save/load/delete independently, auto-resuming the last-opened project on script load
 - Old projects are automatically upgraded to add any new fields introduced by later versions
-
-## Requirements
-
-- `package.json` must stay at the top level of the repo.
-- The registry reads the contents of the `main` branch.
-- The repository must be public.
