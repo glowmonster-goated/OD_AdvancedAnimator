@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/AA-Franz/OD_SpectatorRegistry/refs/heads/main/src/package.schema.json",
+  "name": "glowmonster.advancedanimator",
+  "displayName": "Advanced Animator",
+  "version": "1.70.0",
+  "description": "Replay multi-track timeline editor (camera + POV + speed + FOV + multi-replay layers).",
+  "main": "main.luau",
+  "keywords": [
+    "camera",
+    "animator",
+    "timeline",
+    "replay"
+  ],
+  "author": "glowmonster",
+  "defaultKeybind": "M",
+  "url": "https://github.com/<your-username>/<your-repo-name>.git"
+}
