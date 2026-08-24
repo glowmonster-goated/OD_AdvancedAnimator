@@ -9,7 +9,10 @@ Each of these is its own keyframe lane on the timeline, independently editable:
 - **Position** - camera location, Catmull-Rom curve through keys (or straight lerp)
 - **Rotation** - camera orientation, quaternion spline (or slerp)
 - **Field of View**
-- **Depth of Field** - F-Stop, Focal Distance, Sensor Width (separate lanes)
+- **Post FX** - a collapsible group of post-processing lanes (click the `Post FX` row to expand):
+  - **Depth of Field** - F-Stop, Focal Distance, Sensor Width (separate lanes)
+  - **Motion Blur**, **Vignette**, **Exposure**, **Bloom**, **Chromatic Aberration**
+  - Each Post FX lane only drives its engine setting when it has at least one key, and the animator resets what it touched when you stop previewing or unload, so it never leaves post-processing stuck on the game.
 - **Replay Speed** - how fast the bound replay(s) play back
 - **Timeline Speed** - how fast the camera animation itself plays back (independent of replay speed)
 - **POV** - locks the camera to a player's view instead of freecam keys
@@ -43,7 +46,7 @@ Every key (except POV, which is always a hard cut) can be set to `smooth`, `line
 
 - Click-drag keyframes directly on the timeline lanes; shift-click to multi-select across rows
 - Copy / Paste / Duplicate selected keys, preserving relative timing
-- 20-level undo
+- Multi-level undo, with a configurable step count (Settings -> Timeline -> Undo Steps, 1-100)
 - **Live Key Edit** - move/rotate the freecam and have it write straight into the selected Position/Rotation key
 - Snap-to-grid on all key placement and dragging
 - Step the playhead keyframe-to-keyframe (with press-and-hold auto-repeat)
@@ -60,6 +63,12 @@ Every key (except POV, which is always a hard cut) can be set to `smooth`, `line
 - Draws the raw keyframe path and the smoothed camera path in the world, plus keyframe dots and a highlighted playhead marker
 - Optional look-direction rays sampled along the path
 - Optional ghost camera frustums, either at the playhead or stepped along the whole path
+
+## Export to Blender
+
+Bake any timeline (position, rotation, FOV, DOF, and POV-locked sections, exactly as Preview shows it) and load it into Blender as a real animated camera, using the companion `advanced_animator_import.py` addon. The bake honors the Timeline Speed track, so speed ramps and slow-mo carry over.
+
+**Setup and usage: check the Advanced Animator Discord form for information** on installing the addon, exporting from the game, and loading your shots in Blender.
 
 ## Projects
 

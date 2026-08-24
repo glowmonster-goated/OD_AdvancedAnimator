@@ -1,16 +1,17 @@
 {
   "author": "glowmonster",
   "defaultKeybind": "M",
-  "description": "Replay multi-track timeline editor (camera + POV + speed + FOV + multi-replay layers).",
+  "description": "Replay multi-track timeline editor (camera + POV + speed + FOV + post FX + multi-replay layers).",
   "displayName": "Advanced Animator",
   "keywords": [
     "camera",
     "animator",
     "timeline",
-    "replay"
+    "replay",
+    "postfx"
   ],
   "main": "main.luau",
   "name": "glowmonster.advancedanimator",
-  "version": "1.0.0",
+  "version": "1.4.0",
   "url": "https://github.com/glowmonster-goated/OD_AdvancedAnimator"
 }

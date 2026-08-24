@@ -1,8 +1,8 @@
 metadata = {
 	name = "glowmonster.replay.animator",
-	description = "Replay multi-track timeline editor (camera + POV + speed + FOV + multi-replay layers).",
+	description = "Replay multi-track timeline editor (camera + POV + speed + FOV + post FX + multi-replay layers).",
 	author = "glowmonster",
-	version = 1.70,
+	version = 2.5,
 	defaultKeybind = "M",
 }
 type InterpMode = "smooth" | "linear" | "cut"
@@ -62,6 +62,11 @@ type Tracks = {
 	dofFstop: { NumKey },
 	dofFocalDistance: { NumKey },
 	dofSensorWidth: { NumKey },
+	motionBlur: { NumKey }?,
+	vignette: { NumKey }?,
+	exposure: { NumKey }?,
+	bloom: { NumKey }?,
+	chromatic: { NumKey }?,
 	speed: { NumKey },
 	timelineSpeed: { NumKey },
 	pov: { POVKey },
@@ -352,6 +357,14 @@ local function initDefaults()
 	config.ghostFrustumLength = tonumber(config.ghostFrustumLength) or 700
 	config.ghostFrustumStepSeconds = tonumber(config.ghostFrustumStepSeconds) or 0.5
 	config.ghostFrustumAspect = tonumber(config.ghostFrustumAspect) or (16 / 9)
+	config.postFxLaneExpanded = (config.postFxLaneExpanded == nil) and false or config.postFxLaneExpanded
+	config.driveReplays = (config.driveReplays == nil) and true or config.driveReplays
+	config.exportFps = tonumber(config.exportFps) or 30
+	config.exportFilename = tostring(config.exportFilename or "camera_export")
+	config.undoLimit = math.max(1, math.floor(tonumber(config.undoLimit) or 20))
+	if type(config.exports) ~= "table" then
+		config.exports = {}
+	end
 	if type(config.smoothingPresets) ~= "table" then
 		config.smoothingPresets = {}
 	end
@@ -1089,7 +1102,6 @@ local function clearArray(t)
 		t[i] = nil
 	end
 end
-local UNDO_LIMIT = 20
 local undoStack: { Project } = {}
 local function copyVec3(v: Vec3): Vec3
 	return Vec3.new(v.x, v.y, v.z)
@@ -1113,6 +1125,11 @@ local function deepCopyProject(p: Project): Project
 			dofFstop = {},
 			dofFocalDistance = {},
 			dofSensorWidth = {},
+			motionBlur = {},
+			vignette = {},
+			exposure = {},
+			bloom = {},
+			chromatic = {},
 			speed = {},
 			timelineSpeed = {},
 			pov = {},
@@ -1205,6 +1222,26 @@ local function deepCopyProject(p: Project): Project
 		local k = p.tracks.dofSensorWidth[i]
 		cp.tracks.dofSensorWidth[i] = { t = k.t, v = k.v, interp = k.interp }
 	end
+	for i = 1, #(p.tracks.motionBlur or {}) do
+		local k = p.tracks.motionBlur[i]
+		cp.tracks.motionBlur[i] = { t = k.t, v = k.v, interp = k.interp }
+	end
+	for i = 1, #(p.tracks.vignette or {}) do
+		local k = p.tracks.vignette[i]
+		cp.tracks.vignette[i] = { t = k.t, v = k.v, interp = k.interp }
+	end
+	for i = 1, #(p.tracks.exposure or {}) do
+		local k = p.tracks.exposure[i]
+		cp.tracks.exposure[i] = { t = k.t, v = k.v, interp = k.interp }
+	end
+	for i = 1, #(p.tracks.bloom or {}) do
+		local k = p.tracks.bloom[i]
+		cp.tracks.bloom[i] = { t = k.t, v = k.v, interp = k.interp }
+	end
+	for i = 1, #(p.tracks.chromatic or {}) do
+		local k = p.tracks.chromatic[i]
+		cp.tracks.chromatic[i] = { t = k.t, v = k.v, interp = k.interp }
+	end
 	for i = 1, #p.tracks.speed do
 		local k = p.tracks.speed[i]
 		cp.tracks.speed[i] = { t = k.t, v = k.v, interp = k.interp }
@@ -1264,22 +1301,10 @@ local function pushUndo(project: Project?)
 		return
 	end
 	table.insert(undoStack, deepCopyProject(project))
-	if #undoStack > UNDO_LIMIT then
+	local limit = math.max(1, math.floor(tonumber(config.undoLimit) or 20))
+	while #undoStack > limit do
 		table.remove(undoStack, 1)
 	end
-end
-local function doUndo()
-	if #undoStack <= 0 then
-		return
-	end
-	local prev = undoStack[#undoStack]
-	table.remove(undoStack, #undoStack)
-	local curT = playhead
-	project = prev
-	projectNameInput = prev.projectName
-	playhead = clamp(curT, prev.timelineStart, prev.timelineEnd)
-	config.projects[prev.projectName] = prev
-	safeSaveConfig()
 end
 local replayState = {}
 local lastPlayheadForCut = 0.0
@@ -1297,7 +1322,7 @@ local playhead = 0.0
 local replayDriveState = {}
 local previewEnabled = false
 local editing = true
-local driveReplays = true
+local driveReplays = (config.driveReplays == nil) and true or (config.driveReplays == true)
 local projectNameInput = ""
 local newProjectNameInput = ""
 local smoothingPresetNameInput = ""
@@ -1305,6 +1330,54 @@ local smoothingPresetSelectedName = config.lastSmoothingPreset or ""
 local replaySearch = ""
 local replayPicked = ""
 local replayPickedDuration = 0.0
+-- Defined here (after project/playhead/projectNameInput) so its assignments hit those
+-- locals, not same-named globals. If moved above them, undo silently no-ops.
+local function doUndo()
+	if #undoStack <= 0 then
+		return
+	end
+	local prev = undoStack[#undoStack]
+	table.remove(undoStack, #undoStack)
+	local curT = playhead
+	project = prev
+	projectNameInput = prev.projectName
+	playhead = clamp(curT, prev.timelineStart, prev.timelineEnd)
+	config.projects[prev.projectName] = prev
+	config.lastProject = prev.projectName
+	-- Force the timeline lanes / selection to re-read the restored keys, otherwise the
+	-- stateful keyframeRow widgets keep showing the pre-undo positions.
+	pcall(gmraInvalidateLaneWidgets)
+	gmraClearSelectedAcrossRows()
+	safeSaveConfig()
+end
+-- NOTE: these are intentionally GLOBALS, not locals. The module main chunk is near
+-- Luau's hard limit of 200 local registers; each module-scope `local` permanently
+-- consumes one. Globals cost zero registers. Keep new module-scope state as globals
+-- (or grouped in a table) to avoid "Out of local registers" compile failures.
+gmraPendingBindName = ""
+gmraPendingBindLayer = 0
+gmraPendingBindFrames = 0
+gmraExportActive = false
+gmraExportFrames = {}
+gmraExportFrameIdx = 0
+gmraExportTotalFrames = 0
+gmraExportFps = tonumber(config.exportFps) or 30
+gmraExportSettle = 0
+gmraExportSettleMax = 2
+gmraExportSavedPlayhead = 0
+gmraExportSavedAnimating = false
+gmraExportSavedPreview = false
+gmraExportMarkerFrames = {}
+gmraExportStatus = ""
+gmraExportFilename = tostring(config.exportFilename or "camera_export")
+gmraExportPlayhead = 0
+gmraExportMaxFrames = 0
+gmraExportKeyTimes = {}
+gmraExportKeyIdx = 1
+gmraRenameProjectInput = ""
+gmraRenameLastProject = "\0"
+gmraDirty = false
+gmraDirtyEditFrame = 0
 type BasicPlayer = { playerId: number, frameIndex: number }
 local povPlayerNameSearch = ""
 local povSelectedBasicPlayer: BasicPlayer? = nil
@@ -1334,12 +1407,19 @@ local rfreezeDurationInputState = 1.0
 local rfreezeSelectedIndexState = 1
 local aboutActiveTab = "overview"
 local addKeyTypeOptions =
-	{ "Position", "Rotation", "FOV", "Depth Of Field", "Replay Speed", "Timeline Speed", "POV", "Replay Cut", "Replay Freeze" }
+	{ "Position", "Rotation", "FOV", "Post FX", "Replay Speed", "Timeline Speed", "POV", "Replay Cut", "Replay Freeze" }
 local addKeyTypeIndex = 1
 local addFovValue = 90.0
 local addDofFstopValue = 0.0
 local addDofFocalDistanceValue = 0.0
 local addDofSensorWidthValue = 0.0
+local postFxParamOptions = { "Depth Of Field", "Motion Blur", "Vignette", "Exposure", "Bloom", "Chromatic Aberration" }
+local postFxParamIndex = 1
+local addMotionBlurValue = 0.5
+local addVignetteValue = 0.4
+local addExposureValue = 0.0
+local addBloomValue = 1.0
+local addChromaticValue = 1.0
 local replayTestStatus = ""
 local showPath = (config.showPath == nil) and true or (config.showPath == true)
 local pathLineThickness = 10
@@ -1407,6 +1487,7 @@ camera.positionSmoothing = 0
 camera.rotationSmoothing = 0
 camera.fieldOfViewSmoothing = 0
 local povAppliedThisFrame = false
+postFxWasActive = false
 local function sortKeysByT(keys)
 	table.sort(keys, function(a, b)
 		return a.t < b.t
@@ -1594,9 +1675,17 @@ local function getReplayFrameByName(replayName: string): ReplayFrame?
 	local idx = loadedReplayQueryIndexCache[replayName]
 	if idx == nil then
 		for i = 1, #loadedReplayListCache do
-			if string.find(loadedReplayListCache[i], replayName, 1, true) ~= nil then
+			if loadedReplayListCache[i] == replayName then
 				idx = i
 				break
+			end
+		end
+		if idx == nil then
+			for i = 1, #loadedReplayListCache do
+				if string.find(loadedReplayListCache[i], replayName, 1, true) ~= nil then
+					idx = i
+					break
+				end
 			end
 		end
 		if idx == nil then
@@ -1822,7 +1911,12 @@ function beginUndoFrame()
 	didPushUndoThisFrame = false
 end
 
+function gmraMarkDirty()
+	gmraDirty = true
+	gmraDirtyEditFrame = runtimeFrameCounter
+end
 function pushUndoOnce(p: Project)
+	gmraMarkDirty()
 	if didPushUndoThisFrame then
 		return
 	end
@@ -2410,9 +2504,17 @@ local function getLoadedReplayIndexByName(replayName: string): number?
 	local idx = loadedReplayQueryIndexCache[replayName]
 	if idx == nil then
 		for i = 1, #loadedReplayListCache do
-			if string.find(loadedReplayListCache[i], replayName, 1, true) ~= nil then
+			if loadedReplayListCache[i] == replayName then
 				idx = i
 				break
+			end
+		end
+		if idx == nil then
+			for i = 1, #loadedReplayListCache do
+				if string.find(loadedReplayListCache[i], replayName, 1, true) ~= nil then
+					idx = i
+					break
+				end
 			end
 		end
 		if idx == nil then
@@ -2441,15 +2543,6 @@ local function getLoadedReplayDurationIfAvailable(replayName: string): number?
 		return dur
 	end
 	return nil
-end
-local function segKey(seg: ReplaySegment): string
-	return tostring(seg.replayName)
-		.. "|"
-		.. tostring(seg.dstStart)
-		.. "|"
-		.. tostring(seg.srcStart)
-		.. "|"
-		.. tostring(seg.srcEnd)
 end
 local function safePositiveSpeed(x: number?): number
 	if x == nil or x <= 0 then
@@ -2892,6 +2985,38 @@ function applyPOV(p: Project, t: number): boolean
 	povAppliedThisFrame = true
 	return true
 end
+-- Post-processing is a GLOBAL, sticky engine object. Reset only the fields this
+-- project actually drives so we never clobber another camera's look, and never
+-- leave the animator's blur/vignette/etc. applied after we stop previewing.
+function gmraResetAppliedPostFx()
+	local p = project
+	pcall(function()
+		if not p then
+			postProcessSettings.depthOfFieldFocalDistance = 0
+			return
+		end
+		if #(p.tracks.dofFstop or {}) > 0 or #(p.tracks.dofFocalDistance or {}) > 0 or #(p.tracks.dofSensorWidth or {}) > 0 then
+			postProcessSettings.depthOfFieldFstop = 0
+			postProcessSettings.depthOfFieldFocalDistance = 0
+			postProcessSettings.depthOfFieldSensorWidth = 0
+		end
+		if #(p.tracks.motionBlur or {}) > 0 then
+			postProcessSettings.motionBlurAmount = 0
+		end
+		if #(p.tracks.vignette or {}) > 0 then
+			postProcessSettings.vignetteIntensity = 0
+		end
+		if #(p.tracks.exposure or {}) > 0 then
+			postProcessSettings.autoExposureBias = 0
+		end
+		if #(p.tracks.bloom or {}) > 0 then
+			postProcessSettings.bloomIntensity = 1
+		end
+		if #(p.tracks.chromatic or {}) > 0 then
+			postProcessSettings.chromaticAberrationIntensity = 0
+		end
+	end)
+end
 local function evalAndApplyCamera(p: Project, t: number)
 	if debugPreviewApplyPosition then
 		camera.position = evalVec3Curved(p, t)
@@ -2899,11 +3024,34 @@ local function evalAndApplyCamera(p: Project, t: number)
 	if debugPreviewApplyRotation then
 		camera.rotation = gmraEvalQuatSafe(p.tracks.rotation, t, camera.rotation)
 	end
-	camera.fieldOfView = evalNum(p.tracks.fov, t)
+	if #p.tracks.fov > 0 then
+		camera.fieldOfView = evalNum(p.tracks.fov, t)
+	end
 	pcall(function()
-		postProcessSettings.depthOfFieldFstop = evalNum(p.tracks.dofFstop, t)
-		postProcessSettings.depthOfFieldFocalDistance = evalNum(p.tracks.dofFocalDistance, t)
-		postProcessSettings.depthOfFieldSensorWidth = evalNum(p.tracks.dofSensorWidth, t)
+		if #(p.tracks.dofFstop or {}) > 0 then
+			postProcessSettings.depthOfFieldFstop = math.max(0, evalNum(p.tracks.dofFstop, t))
+		end
+		if #(p.tracks.dofFocalDistance or {}) > 0 then
+			postProcessSettings.depthOfFieldFocalDistance = math.max(0, evalNum(p.tracks.dofFocalDistance, t))
+		end
+		if #(p.tracks.dofSensorWidth or {}) > 0 then
+			postProcessSettings.depthOfFieldSensorWidth = math.max(0, evalNum(p.tracks.dofSensorWidth, t))
+		end
+		if #(p.tracks.motionBlur or {}) > 0 then
+			postProcessSettings.motionBlurAmount = clamp(evalNum(p.tracks.motionBlur, t), 0, 1)
+		end
+		if #(p.tracks.vignette or {}) > 0 then
+			postProcessSettings.vignetteIntensity = clamp(evalNum(p.tracks.vignette, t), 0, 1)
+		end
+		if #(p.tracks.exposure or {}) > 0 then
+			postProcessSettings.autoExposureBias = clamp(evalNum(p.tracks.exposure, t), -8, 8)
+		end
+		if #(p.tracks.bloom or {}) > 0 then
+			postProcessSettings.bloomIntensity = math.max(0, evalNum(p.tracks.bloom, t))
+		end
+		if #(p.tracks.chromatic or {}) > 0 then
+			postProcessSettings.chromaticAberrationIntensity = math.max(0, evalNum(p.tracks.chromatic, t))
+		end
 	end)
 	applyPOV(p, t)
 end
@@ -3169,6 +3317,11 @@ local function upgradeProject(p: Project)
 	p.tracks.dofFstop = p.tracks.dofFstop or { { t = 0, v = 0, interp = "smooth" } }
 	p.tracks.dofFocalDistance = p.tracks.dofFocalDistance or { { t = 0, v = 0, interp = "smooth" } }
 	p.tracks.dofSensorWidth = p.tracks.dofSensorWidth or { { t = 0, v = 0, interp = "smooth" } }
+	p.tracks.motionBlur = p.tracks.motionBlur or {}
+	p.tracks.vignette = p.tracks.vignette or {}
+	p.tracks.exposure = p.tracks.exposure or {}
+	p.tracks.bloom = p.tracks.bloom or {}
+	p.tracks.chromatic = p.tracks.chromatic or {}
 	p.tracks.speed = p.tracks.speed or { { t = 0, v = 1, interp = "smooth" } }
 	p.tracks.timelineSpeed = p.tracks.timelineSpeed or { { t = 0, v = 1, interp = "smooth" } }
 	if p.tracks.timelineSpeed == p.tracks.speed then
@@ -3194,6 +3347,11 @@ local function upgradeProject(p: Project)
 	sortKeysByT(p.tracks.dofFstop)
 	sortKeysByT(p.tracks.dofFocalDistance)
 	sortKeysByT(p.tracks.dofSensorWidth)
+	sortKeysByT(p.tracks.motionBlur)
+	sortKeysByT(p.tracks.vignette)
+	sortKeysByT(p.tracks.exposure)
+	sortKeysByT(p.tracks.bloom)
+	sortKeysByT(p.tracks.chromatic)
 	sortKeysByT(p.tracks.speed)
 	sortKeysByT(p.tracks.timelineSpeed)
 	sortKeysByT(p.tracks.pov)
@@ -3224,6 +3382,11 @@ local function makeEmptyProject(name: string): Project
 			dofFstop = { { t = 0, v = 0, interp = "smooth" } },
 			dofFocalDistance = { { t = 0, v = 0, interp = "smooth" } },
 			dofSensorWidth = { { t = 0, v = 0, interp = "smooth" } },
+			motionBlur = {},
+			vignette = {},
+			exposure = {},
+			bloom = {},
+			chromatic = {},
 			speed = { { t = 0, v = 1, interp = "smooth" } },
 			timelineSpeed = { { t = 0, v = 1, interp = "smooth" } },
 			pov = {},
@@ -3278,15 +3441,99 @@ function loadProjectByName(name: string)
 		project = p
 		projectNameInput = name
 		playhead = p.timelineStart
+		config.lastProject = name
 	end
+end
+function gmraTrimName(s: string): string
+	local out = string.match(tostring(s or ""), "^%s*(.-)%s*$")
+	return out or ""
+end
+function gmraProjectKeyCount(proj: Project): number
+	local t = proj.tracks
+	if not t then
+		return 0
+	end
+	local function c(k)
+		return #(k or {})
+	end
+	return c(t.position) + c(t.rotation) + c(t.fov) + c(t.dofFstop) + c(t.dofFocalDistance) + c(t.dofSensorWidth) + c(
+		t.motionBlur
+	) + c(t.vignette) + c(t.exposure) + c(t.bloom) + c(t.chromatic) + c(t.speed) + c(t.timelineSpeed) + c(t.pov) + c(
+		t.replayCuts
+	)
+end
+function gmraRenameProject(oldName: string, newName: string): boolean
+	newName = gmraTrimName(newName)
+	if oldName == "" or newName == "" or oldName == newName then
+		return false
+	end
+	if config.projects[newName] then
+		return false
+	end
+	local proj = config.projects[oldName]
+	if not proj then
+		return false
+	end
+	proj.projectName = newName
+	config.projects[newName] = proj
+	config.projects[oldName] = nil
+	if config.lastProject == oldName then
+		config.lastProject = newName
+	end
+	if projectNameInput == oldName then
+		projectNameInput = newName
+	end
+	-- Move the stored Blender export with the project.
+	if type(config.exports) == "table" and config.exports[oldName] ~= nil then
+		local ex = config.exports[oldName]
+		if type(ex) == "table" then
+			ex.name = string.gsub(newName, "[^%w_]", "_")
+		end
+		config.exports[newName] = ex
+		config.exports[oldName] = nil
+	end
+	safeSaveConfig()
+	return true
+end
+function gmraDuplicateProject(name: string, newName: string): boolean
+	newName = gmraTrimName(newName)
+	local proj = config.projects[name]
+	if not proj or newName == "" or config.projects[newName] then
+		return false
+	end
+	local cp = deepCopyProject(proj)
+	cp.projectName = newName
+	config.projects[newName] = cp
+	safeSaveConfig()
+	return true
+end
+function gmraDeleteProjectByName(name: string)
+	if name == "" or not config.projects or not config.projects[name] then
+		return
+	end
+	if type(config.exports) == "table" then
+		config.exports[name] = nil
+	end
+	config.projects[name] = nil
+	if project and (project :: Project).projectName == name then
+		project = nil
+		projectNameInput = ""
+	end
+	if config.lastProject == name then
+		config.lastProject = ""
+	end
+	safeSaveConfig()
 end
 local function writePositionKey(p: Project, t: number)
 	t = alignTo(t, p.snap)
-	table.insert(p.tracks.position, {
-		t = t,
-		v = Vec3.new(camera.position.x, camera.position.y, camera.position.z),
-		interp = "smooth",
-	})
+	local v = Vec3.new(camera.position.x, camera.position.y, camera.position.z)
+	for i = 1, #p.tracks.position do
+		if feq(p.tracks.position[i].t, t, 1e-6) then
+			p.tracks.position[i].v = v
+			return
+		end
+	end
+	table.insert(p.tracks.position, { t = t, v = v, interp = "smooth" })
 	sortKeysByT(p.tracks.position)
 end
 local function upsertQuatKey(keys: { QuatKey }, t: number, v: Quat, interp: InterpMode)
@@ -3313,6 +3560,12 @@ local function writeRotationKey(p: Project, t: number)
 end
 local function writeFovKey(p: Project, t: number)
 	t = alignTo(t, p.snap)
+	for i = 1, #p.tracks.fov do
+		if feq(p.tracks.fov[i].t, t, 1e-6) then
+			p.tracks.fov[i].v = camera.fieldOfView
+			return
+		end
+	end
 	table.insert(p.tracks.fov, { t = t, v = camera.fieldOfView, interp = "smooth" })
 	sortKeysByT(p.tracks.fov)
 end
@@ -3432,6 +3685,63 @@ function bindLayerToLoadedReplay(p: Project, layerId: number, replayName: string
 	replayPickedDuration = dur
 	p.ui.rangeStart = clamp(p.ui.rangeStart, p.timelineStart, p.timelineEnd)
 	p.ui.rangeEnd = clamp(p.ui.rangeEnd, p.ui.rangeStart + 0.1, p.timelineEnd)
+end
+GMRA_ALL_REPLAYS_CACHE = {}
+GMRA_ALL_REPLAYS_CACHE_FRAME = -1
+function gmraListAllReplays(): { string }
+	if GMRA_ALL_REPLAYS_CACHE_FRAME >= 0 and (runtimeFrameCounter - GMRA_ALL_REPLAYS_CACHE_FRAME) < 120 then
+		return GMRA_ALL_REPLAYS_CACHE
+	end
+	GMRA_ALL_REPLAYS_CACHE_FRAME = runtimeFrameCounter
+	local ok, list = pcall(function()
+		return Replay.listAll()
+	end)
+	GMRA_ALL_REPLAYS_CACHE = (ok and list) or {}
+	return GMRA_ALL_REPLAYS_CACHE
+end
+function gmraIsReplayLoaded(name: string): boolean
+	return name ~= "" and getLoadedReplayIndexByName(name) ~= nil
+end
+function gmraEnsureReplayLoaded(name: string): boolean
+	if name == "" then
+		return false
+	end
+	if gmraIsReplayLoaded(name) then
+		return true
+	end
+	pcall(function()
+		Replay.load(name)
+	end)
+	gmraInvalidateReplayCaches()
+	GMRA_ALL_REPLAYS_CACHE_FRAME = -1
+	return gmraIsReplayLoaded(name)
+end
+function gmraReplayNameStillUsed(p: Project, name: string, exceptLayerId: number?): boolean
+	if name == "" then
+		return false
+	end
+	for i = 1, #p.replayLayers do
+		if i ~= exceptLayerId then
+			for _, seg in ipairs(p.replayLayers[i].segments or {}) do
+				if seg.replayName == name then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+function gmraUnloadReplayByName(name: string): boolean
+	local idx = getLoadedReplayIndexByName(name)
+	if not idx then
+		return false
+	end
+	pcall(function()
+		Replay.unloadByIndex(idx)
+	end)
+	gmraInvalidateReplayCaches()
+	GMRA_ALL_REPLAYS_CACHE_FRAME = -1
+	return true
 end
 function removeReplayLayer(p: Project, layerId: number)
 	if #p.replayLayers <= 1 then
@@ -3736,6 +4046,31 @@ function deleteSelectedKey(p: Project)
 			table.remove(p.tracks.dofSensorWidth, idx)
 		end
 		sortKeysByT(p.tracks.dofSensorWidth)
+	elseif row == "Motion Blur" then
+		if p.tracks.motionBlur[idx] then
+			table.remove(p.tracks.motionBlur, idx)
+		end
+		sortKeysByT(p.tracks.motionBlur)
+	elseif row == "Vignette" then
+		if p.tracks.vignette[idx] then
+			table.remove(p.tracks.vignette, idx)
+		end
+		sortKeysByT(p.tracks.vignette)
+	elseif row == "Exposure" then
+		if p.tracks.exposure[idx] then
+			table.remove(p.tracks.exposure, idx)
+		end
+		sortKeysByT(p.tracks.exposure)
+	elseif row == "Bloom" then
+		if p.tracks.bloom[idx] then
+			table.remove(p.tracks.bloom, idx)
+		end
+		sortKeysByT(p.tracks.bloom)
+	elseif row == "Chromatic Aberration" then
+		if p.tracks.chromatic[idx] then
+			table.remove(p.tracks.chromatic, idx)
+		end
+		sortKeysByT(p.tracks.chromatic)
 	elseif row == "Replay Speed" then
 		if p.tracks.speed[idx] then
 			table.remove(p.tracks.speed, idx)
@@ -3785,6 +4120,16 @@ function rowToBase(row: string): string?
 		return "dofFocalDistance"
 	elseif row == "DOF Sensor Width" then
 		return "dofSensorWidth"
+	elseif row == "Motion Blur" then
+		return "motionBlur"
+	elseif row == "Vignette" then
+		return "vignette"
+	elseif row == "Exposure" then
+		return "exposure"
+	elseif row == "Bloom" then
+		return "bloom"
+	elseif row == "Chromatic Aberration" then
+		return "chromatic"
 	elseif row == "Replay Speed" then
 		return "speed"
 	elseif row == "Timeline Speed" then
@@ -3809,6 +4154,16 @@ function rowKeys(p: Project, row: string)
 		return p.tracks.dofFocalDistance
 	elseif row == "DOF Sensor Width" then
 		return p.tracks.dofSensorWidth
+	elseif row == "Motion Blur" then
+		return p.tracks.motionBlur
+	elseif row == "Vignette" then
+		return p.tracks.vignette
+	elseif row == "Exposure" then
+		return p.tracks.exposure
+	elseif row == "Bloom" then
+		return p.tracks.bloom
+	elseif row == "Chromatic Aberration" then
+		return p.tracks.chromatic
 	elseif row == "Replay Speed" then
 		return p.tracks.speed
 	elseif row == "Timeline Speed" then
@@ -3854,6 +4209,11 @@ function gmraDeleteSelectedKeys(p: Project): boolean
 		"DOF F-Stop",
 		"DOF Focus Distance",
 		"DOF Sensor Width",
+		"Motion Blur",
+		"Vignette",
+		"Exposure",
+		"Bloom",
+		"Chromatic Aberration",
 		"Replay Speed",
 		"Timeline Speed",
 		"POV",
@@ -3890,6 +4250,34 @@ end
 local keyframeStepHoldDir = 0
 local keyframeStepHoldTime = 0.0
 local keyframeStepRepeatAccum = 0.0
+function gmraGatherLabeledKeyTimes(p: Project)
+	local out = {}
+	local function add(keys, label: string)
+		for i = 1, #(keys or {}) do
+			local k = keys[i]
+			if k then
+				out[#out + 1] = { t = k.t, label = label }
+			end
+		end
+	end
+	add(p.tracks.position, "POS")
+	add(p.tracks.rotation, "ROT")
+	add(p.tracks.fov, "FOV")
+	add(p.tracks.dofFocalDistance, "DOF")
+	add(p.tracks.motionBlur, "BLUR")
+	add(p.tracks.vignette, "VIG")
+	add(p.tracks.exposure, "EXP")
+	add(p.tracks.bloom, "BLOOM")
+	add(p.tracks.chromatic, "CHROMA")
+	add(p.tracks.speed, "SPD")
+	add(p.tracks.timelineSpeed, "TSPD")
+	add(p.tracks.pov, "POV")
+	add(p.tracks.replayCuts, "CUT")
+	table.sort(out, function(a, b)
+		return a.t < b.t
+	end)
+	return out
+end
 function gmraGatherAllKeyTimes(p: Project): { number }
 	local out: { number } = {}
 	local function addKeyTimes(keys)
@@ -3906,6 +4294,11 @@ function gmraGatherAllKeyTimes(p: Project): { number }
 	addKeyTimes(p.tracks.dofFstop)
 	addKeyTimes(p.tracks.dofFocalDistance)
 	addKeyTimes(p.tracks.dofSensorWidth)
+	addKeyTimes(p.tracks.motionBlur)
+	addKeyTimes(p.tracks.vignette)
+	addKeyTimes(p.tracks.exposure)
+	addKeyTimes(p.tracks.bloom)
+	addKeyTimes(p.tracks.chromatic)
 	addKeyTimes(p.tracks.speed)
 	addKeyTimes(p.tracks.timelineSpeed)
 	addKeyTimes(p.tracks.pov)
@@ -4029,6 +4422,11 @@ function copySelectedKeysToClipboard(p: Project): boolean
 				or row == "DOF F-Stop"
 				or row == "DOF Focus Distance"
 				or row == "DOF Sensor Width"
+				or row == "Motion Blur"
+				or row == "Vignette"
+				or row == "Exposure"
+				or row == "Bloom"
+				or row == "Chromatic Aberration"
 				or row == "Replay Speed"
 				or row == "Timeline Speed"
 			then
@@ -4089,6 +4487,16 @@ function pasteClipboardAtPlayhead(p: Project, anchorT: number): boolean
 			upsertNumKey(p.tracks.dofFocalDistance, tt, e.vNum or 0, e.interp or "smooth")
 		elseif row == "DOF Sensor Width" then
 			upsertNumKey(p.tracks.dofSensorWidth, tt, e.vNum or 0, e.interp or "smooth")
+		elseif row == "Motion Blur" then
+			upsertNumKey(p.tracks.motionBlur, tt, e.vNum or 0, e.interp or "smooth")
+		elseif row == "Vignette" then
+			upsertNumKey(p.tracks.vignette, tt, e.vNum or 0, e.interp or "smooth")
+		elseif row == "Exposure" then
+			upsertNumKey(p.tracks.exposure, tt, e.vNum or 0, e.interp or "smooth")
+		elseif row == "Bloom" then
+			upsertNumKey(p.tracks.bloom, tt, e.vNum or 1, e.interp or "smooth")
+		elseif row == "Chromatic Aberration" then
+			upsertNumKey(p.tracks.chromatic, tt, e.vNum or 0, e.interp or "smooth")
 		elseif row == "Replay Speed" then
 			upsertNumKey(p.tracks.speed, tt, e.vNum or 1, e.interp or "smooth")
 		elseif row == "Timeline Speed" then
@@ -4176,6 +4584,33 @@ function gmraTooltip(text: string)
 end
 function hasFn(name: string): boolean
 	return (Gui[name] ~= nil)
+end
+function gmraIcon(name: string): string
+	return (type(Icon) == "table" and Icon[name]) or ""
+end
+function gmraSectionLabel(text: string)
+	if Gui.separatorText ~= nil then
+		Gui.separatorText(text)
+	else
+		Gui.separator()
+		Gui.text(text)
+	end
+end
+GMRA_COL_PLAY = LinearColor.new(0.18, 0.52, 0.30, 1.0)
+GMRA_COL_PAUSE = LinearColor.new(0.72, 0.48, 0.15, 1.0)
+GMRA_COL_PREVIEW = LinearColor.new(0.20, 0.45, 0.78, 1.0)
+GMRA_COL_FREECAM = LinearColor.new(0.30, 0.40, 0.52, 1.0)
+GMRA_COL_REC = LinearColor.new(0.75, 0.20, 0.20, 1.0)
+GMRA_COL_OFF = LinearColor.new(0.26, 0.28, 0.32, 1.0)
+GMRA_COL_ACCENT = LinearColor.new(0.75, 0.88, 1.0, 1.0)
+function gmraColoredToggle(id: string, isOn: boolean, onColor: LinearColor, label: string): boolean
+	local ok, clicked = pcall(function()
+		return Gui.buttonColored(isOn and onColor or GMRA_COL_OFF, label .. "##" .. id)
+	end)
+	if ok then
+		return clicked == true
+	end
+	return Gui.button(label .. "##" .. id)
 end
 function gmraIsItemActiveSafe(): boolean
 	local ok, active = pcall(function()
@@ -4491,6 +4926,7 @@ function computeDragDeltaFromWidget(
 	return newPts[bestIdx].x - anchorStartX
 end
 function resolveDragCollisions(keys, dragRefs, dragDelta: number?, snap: number)
+	gmraMarkDirty()
 	if not keys or #keys == 0 then
 		return
 	end
@@ -5022,6 +5458,141 @@ function gmraDrawSelectedKeyEditor(p: Project)
 					end
 					sortKeysByT(p.tracks.dofSensorWidth)
 				end
+			elseif row == "Motion Blur" then
+				local k = p.tracks.motionBlur[idx]
+				if k then
+					local oldT = k.t
+					local newT = alignTo(
+						Gui.dragFloat("Time (s)##mblurT", oldT, p.snap, p.timelineStart - 9999, p.timelineEnd + 9999),
+						p.snap
+					)
+					if not feq(oldT, newT) then
+						pushUndoOnce(p)
+						k.t = newT
+					end
+					local oldV = k.v
+					local newV = safeSliderFloat("Motion Blur##mblurV", oldV, 0, 1)
+					if not feq(oldV, newV) then
+						pushUndoOnce(p)
+						k.v = clamp(newV, 0, 1)
+					end
+					local oldInterp = k.interp or "smooth"
+					local i1 = comboIndex("Interp##mblurInterp", gmraInterpToIndex(oldInterp), interpOptions)
+					local newInterp = gmraIndexToInterp(i1)
+					if oldInterp ~= newInterp then
+						pushUndoOnce(p)
+						k.interp = newInterp
+					end
+					sortKeysByT(p.tracks.motionBlur)
+				end
+			elseif row == "Vignette" then
+				local k = p.tracks.vignette[idx]
+				if k then
+					local oldT = k.t
+					local newT = alignTo(
+						Gui.dragFloat("Time (s)##vigT", oldT, p.snap, p.timelineStart - 9999, p.timelineEnd + 9999),
+						p.snap
+					)
+					if not feq(oldT, newT) then
+						pushUndoOnce(p)
+						k.t = newT
+					end
+					local oldV = k.v
+					local newV = safeSliderFloat("Vignette##vigV", oldV, 0, 1)
+					if not feq(oldV, newV) then
+						pushUndoOnce(p)
+						k.v = clamp(newV, 0, 1)
+					end
+					local oldInterp = k.interp or "smooth"
+					local i1 = comboIndex("Interp##vigInterp", gmraInterpToIndex(oldInterp), interpOptions)
+					local newInterp = gmraIndexToInterp(i1)
+					if oldInterp ~= newInterp then
+						pushUndoOnce(p)
+						k.interp = newInterp
+					end
+					sortKeysByT(p.tracks.vignette)
+				end
+			elseif row == "Exposure" then
+				local k = p.tracks.exposure[idx]
+				if k then
+					local oldT = k.t
+					local newT = alignTo(
+						Gui.dragFloat("Time (s)##expT", oldT, p.snap, p.timelineStart - 9999, p.timelineEnd + 9999),
+						p.snap
+					)
+					if not feq(oldT, newT) then
+						pushUndoOnce(p)
+						k.t = newT
+					end
+					local oldV = k.v
+					local newV = safeSliderFloat("Exposure Bias (EV)##expV", oldV, -4, 4)
+					if not feq(oldV, newV) then
+						pushUndoOnce(p)
+						k.v = clamp(newV, -8, 8)
+					end
+					local oldInterp = k.interp or "smooth"
+					local i1 = comboIndex("Interp##expInterp", gmraInterpToIndex(oldInterp), interpOptions)
+					local newInterp = gmraIndexToInterp(i1)
+					if oldInterp ~= newInterp then
+						pushUndoOnce(p)
+						k.interp = newInterp
+					end
+					sortKeysByT(p.tracks.exposure)
+				end
+			elseif row == "Bloom" then
+				local k = p.tracks.bloom[idx]
+				if k then
+					local oldT = k.t
+					local newT = alignTo(
+						Gui.dragFloat("Time (s)##bloomT", oldT, p.snap, p.timelineStart - 9999, p.timelineEnd + 9999),
+						p.snap
+					)
+					if not feq(oldT, newT) then
+						pushUndoOnce(p)
+						k.t = newT
+					end
+					local oldV = k.v
+					local newV = safeSliderFloat("Bloom Intensity##bloomV", oldV, 0, 8)
+					if not feq(oldV, newV) then
+						pushUndoOnce(p)
+						k.v = math.max(0, newV)
+					end
+					local oldInterp = k.interp or "smooth"
+					local i1 = comboIndex("Interp##bloomInterp", gmraInterpToIndex(oldInterp), interpOptions)
+					local newInterp = gmraIndexToInterp(i1)
+					if oldInterp ~= newInterp then
+						pushUndoOnce(p)
+						k.interp = newInterp
+					end
+					sortKeysByT(p.tracks.bloom)
+				end
+			elseif row == "Chromatic Aberration" then
+				local k = p.tracks.chromatic[idx]
+				if k then
+					local oldT = k.t
+					local newT = alignTo(
+						Gui.dragFloat("Time (s)##chromaT", oldT, p.snap, p.timelineStart - 9999, p.timelineEnd + 9999),
+						p.snap
+					)
+					if not feq(oldT, newT) then
+						pushUndoOnce(p)
+						k.t = newT
+					end
+					local oldV = k.v
+					local newV = safeSliderFloat("Chromatic Aberration (%)##chromaV", oldV, 0, 5)
+					if not feq(oldV, newV) then
+						pushUndoOnce(p)
+						k.v = math.max(0, newV)
+					end
+					local oldInterp = k.interp or "smooth"
+					local i1 = comboIndex("Interp##chromaInterp", gmraInterpToIndex(oldInterp), interpOptions)
+					local newInterp = gmraIndexToInterp(i1)
+					if oldInterp ~= newInterp then
+						pushUndoOnce(p)
+						k.interp = newInterp
+					end
+					sortKeysByT(p.tracks.chromatic)
+				end
 			elseif row == "Replay Speed" then
 				local k = p.tracks.speed[idx]
 				if k then
@@ -5143,15 +5714,27 @@ function gmraAboutCardTitle(text: string)
 	Gui.text(text)
 end
 
-function gmraAboutItem(title: string, line1: string, line2: string?)
-	Gui.text(title .. " - " .. line1)
-	if line2 and line2 ~= "" then
-		Gui.text(line2)
+function gmraWrapped(text: string)
+	if Gui.textWrapped ~= nil then
+		Gui.textWrapped(text)
+	else
+		Gui.text(text)
 	end
 end
 
+function gmraAboutItem(title: string, line1: string, line2: string?)
+	Gui.textColored(GMRA_COL_ACCENT, gmraIcon("AngleRight") .. " " .. title)
+	gmraWrapped(line1)
+	if line2 and line2 ~= "" then
+		gmraWrapped(line2)
+	end
+	Gui.spacing()
+end
+
 function gmraAboutStep(stepLabel: string, title: string, body: string)
-	Gui.text(stepLabel .. ". " .. title .. " - " .. body)
+	Gui.textColored(GMRA_COL_ACCENT, stepLabel .. ".  " .. title)
+	gmraWrapped(body)
+	Gui.spacing()
 end
 
 function gmraAboutTabButton(id: string, label: string)
@@ -5162,125 +5745,93 @@ function gmraAboutTabButton(id: string, label: string)
 end
 
 function gmraDrawAboutSection()
-	if Gui.collapsingHeader("About") then
+	do
 		gmraIndentBlock()
-		gmraAboutHeader("Replay Camera Animator")
-		Gui.text("Make camera shots over replays.")
-		Gui.text("Set keys, preview the path, then record it.")
-		Gui.separator()
-		gmraAboutTabButton("overview", "Overview")
-		Gui.sameLine()
-		gmraAboutTabButton("workflow", "Workflow")
-		Gui.sameLine()
-		gmraAboutTabButton("sections", "Sections")
-		Gui.sameLine()
-		gmraAboutTabButton("tracks", "Tracks")
-		Gui.sameLine()
-		gmraAboutTabButton("editing", "Editing")
-		Gui.sameLine()
-		gmraAboutTabButton("terms", "Camera Terms")
-		Gui.sameLine()
-		gmraAboutTabButton("tips", "Tips")
-		Gui.separator()
-
-		if aboutActiveTab == "workflow" then
-			gmraAboutHeader("How To Use It")
-			gmraAboutStep("1", "Project", "Make or load a project.")
-			gmraAboutStep("2", "Replays", "Add a layer and bind a loaded replay.")
-			gmraAboutStep("3", "Add Keys", "Pick a key type and add it at the playhead.")
-			gmraAboutStep("4", "Edit", "Click a key and fix the values.")
-			gmraAboutStep("5", "Preview", "Turn Preview Camera on.")
-			gmraAboutStep("6", "Record", "Capture it when it looks good.")
-			gmraAboutHeader("Fast First Shot")
-			gmraAboutItem("Good Starter", "Add Pos+Rot+FOV first, then add DOF, POV, Replay Cuts, or Replay Freezes only when needed.")
-			gmraAboutItem("Replay Freeze Flow", "Add it from Add Key Type, then open Active Freezes to edit or delete it.")
-		elseif aboutActiveTab == "sections" then
-			gmraAboutHeader("Main UI Parts")
-			gmraAboutItem("Project", "Save and load your shot.")
-			gmraAboutItem("Timeline", "Add keys and move the playhead.")
-			gmraAboutItem("Add Keys", "Drop Position, Rotation, FOV, DOF, POV, speed, Replay Cut, and Replay Freeze keys.")
-			gmraAboutItem("Selected Key Editor", "Edit the key you clicked.")
-			gmraAboutItem("Smoothing", "Change how the camera flows.")
-			gmraAboutItem(
-				"Replays",
-				"Bind replay layers and edit their timing.",
-				"Use Timeline Start for replay position. Use Active Freezes for freeze ranges. Mute hides one layer. Solo lets only solo layers show."
-			)
-			gmraAboutItem("Settings", "Global options for the tool.")
-		elseif aboutActiveTab == "tracks" then
-			gmraAboutHeader("Track Rows")
-			gmraAboutItem("Position", "Moves the camera.")
-			gmraAboutItem("Rotation", "Points the camera.")
+		Gui.textColored(GMRA_COL_ACCENT, gmraIcon("Film") .. "  Advanced Animator")
+		gmraWrapped("Make camera shots over replays. Set keys, preview the path, then record it.")
+		Gui.spacing()
+		gmraAboutHeader(gmraIcon("Rocket") .. " Quick Start")
+		gmraAboutStep("1", "Project", "Make or load a project at the top of the panel.")
+		gmraAboutStep("2", "Replays", "In the Replays tab, filter a replay and hit Load & Bind.")
+		gmraAboutStep("3", "Keys", "In the Timeline tab, use Add Key to place keys at the playhead.")
+		gmraAboutStep("4", "Edit", "Click a key on a lane to edit it in the Selected Key Editor.")
+		gmraAboutStep("5", "Preview", "Hit Preview in the top bar to judge the real shot.")
+		gmraAboutStep("6", "Record", "Turn on REC for a clean capture, then record.")
+		if Gui.collapsingHeader(gmraIcon("Stream") .. " Workflow Tips##helpWorkflow") then
+			gmraIndentBlock()
+			gmraAboutItem("Good Starter", "Add Pos+Rot+FOV at a few playhead positions, then Preview.")
+			gmraAboutItem("Add Post FX later", "Open the Post FX group at the bottom of the graph only when you want DOF, blur, vignette, etc.")
+			gmraAboutItem("Build vs Judge", "Keep Preview OFF while placing keys (the camera follows your freecam so you can fly around). Turn Preview ON to see the real timeline-driven shot.")
+			gmraAboutItem("Replay Freeze Flow", "Add it from Add Key, then open Active Freezes to edit or delete it.")
+			gmraUnindentBlock()
+		end
+		if Gui.collapsingHeader(gmraIcon("Th") .. " Tabs & Toolbar##helpLayout") then
+			gmraIndentBlock()
+			gmraAboutHeader("Top Bar (always visible)")
+			gmraAboutItem("Play / Preview / REC / Undo", "Work from any tab. Preview drives the camera from the timeline; REC hides overlays for a clean capture.")
+			gmraAboutItem("Header", "Shows the current project and mode.")
+			gmraAboutHeader("Tabs")
+			gmraAboutItem("Timeline", "Clipboard, Add Key, the track lanes, the Post FX group, and the Selected Key Editor.")
+			gmraAboutItem("Smoothing", "Change how the camera flows, plus presets.")
+			gmraAboutItem("Replays", "Filter a replay, Load & Bind it to a layer, then trim its timing.")
+			gmraAboutItem("Settings", "Timeline, world draw, keybinds and debug options.")
+			gmraUnindentBlock()
+		end
+		if Gui.collapsingHeader(gmraIcon("SlidersH") .. " Track Types##helpTracks") then
+			gmraIndentBlock()
+			gmraAboutHeader("Core Rows")
+			gmraAboutItem("Position / Rotation", "Move and point the camera.")
 			gmraAboutItem("Field of View", "Changes zoom.")
-			gmraAboutItem("DOF F-Stop", "Controls depth of field strength.")
-			gmraAboutItem("DOF Focus Distance", "Controls what distance is in focus.")
-			gmraAboutItem("DOF Sensor Width", "Shapes the depth of field look.")
-			gmraAboutItem("Replay Speed", "Changes replay speed.")
-			gmraAboutItem("Timeline Speed", "Changes animation speed.")
-			gmraAboutItem("POV", "Locks to a player view.")
-			gmraAboutItem("Replay Cuts", "Jumps the replay to a new time.")
-			gmraAboutItem("Replay Freeze", "Pauses replay source time for part of a layer. Add it from Add Key Type.")
-		elseif aboutActiveTab == "editing" then
-			gmraAboutHeader("Editing Keys")
-			gmraAboutItem("Click", "Select a key.")
+			gmraAboutItem("Replay Speed", "Changes replay playback speed.")
+			gmraAboutItem("Timeline Speed", "Changes animation play speed.")
+			gmraAboutItem("POV", "Locks to a player's view.")
+			gmraAboutItem("Replay Cuts", "Jumps the replay to a new source time.")
+			gmraAboutItem("Replay Freeze", "Pauses replay source time for part of a layer.")
+			gmraAboutHeader("Post FX (bottom of the graph)")
+			gmraAboutItem("Depth of Field", "F-Stop, Focus Distance and Sensor Width shape the blur.")
+			gmraAboutItem("Motion Blur", "Blur on fast camera moves.")
+			gmraAboutItem("Vignette", "Darkens the frame corners.")
+			gmraAboutItem("Exposure", "Brightens or darkens the whole shot.")
+			gmraAboutItem("Bloom", "Glow on bright areas.")
+			gmraAboutItem("Chromatic Aberration", "Color fringing at the edges.")
+			gmraUnindentBlock()
+		end
+		if Gui.collapsingHeader(gmraIcon("Edit") .. " Editing Keys##helpEditing") then
+			gmraIndentBlock()
+			gmraAboutHeader("Selecting & Editing")
+			gmraAboutItem("Click", "Select a key on a lane.")
 			gmraAboutItem("Shift Select", "Select keys across rows so you can delete them together.")
-			gmraAboutItem("Arrow Keys", "Left and Right step the playhead one keyframe at a time. Hold to move faster.")
-			gmraAboutItem("Right Click", "Open the editor faster.")
-			gmraAboutItem("Delete", "Remove the selected key or multi-selection.")
-			gmraAboutHeader("Use The Camera")
-			gmraAboutItem("Set Position", "Grab the current camera location.")
-			gmraAboutItem("Set Rotation", "Grab the current camera rotation.")
-			gmraAboutItem("Get Current DOF", "Pull the current depth of field values into the add builder.")
-			gmraAboutItem("Live Edit", "Move the camera to update the key.")
-			gmraAboutHeader("Replay Freeze Editing")
-			gmraAboutItem("Active Freezes", "Open it to pick a freeze, move it to another layer, edit start/end, or delete it.")
-			gmraAboutItem("Replay Bars", "The blue replay bars are view-only now. Edit replay timing with sliders and fields.")
-		elseif aboutActiveTab == "terms" then
-			gmraAboutHeader("Camera Terms")
+			gmraAboutItem("Arrow Keys", "Left / Right step the playhead one keyframe at a time. Hold to move faster.")
+			gmraAboutItem("Right Click", "Opens the Selected Key Editor faster.")
+			gmraAboutItem("Delete", "Removes the selected key or multi-selection.")
+			gmraAboutHeader("Grab From The Camera")
+			gmraAboutItem("Set Position / Rotation", "Grab the current freecam pose into the key.")
+			gmraAboutItem("Get Current DOF", "Pull the live depth of field values into the add builder.")
+			gmraAboutItem("Live Edit", "Move the camera to update the selected key in real time.")
+			gmraUnindentBlock()
+		end
+		if Gui.collapsingHeader(gmraIcon("QuestionCircle") .. " Camera Terms##helpTerms") then
+			gmraIndentBlock()
 			gmraAboutItem("FOV", "How wide the camera looks. Higher = wider, lower = more zoomed in.")
-			gmraAboutItem("F-Stop", "How strong the blur is. Lower usually means more blur.")
-			gmraAboutItem("Focal Distance", "What distance from the camera should be in focus.")
+			gmraAboutItem("F-Stop", "How strong the DOF blur is. Lower usually means more blur.")
+			gmraAboutItem("Focal Distance", "What distance from the camera is in focus.")
 			gmraAboutItem("Sensor Width", "Changes the feel of the depth of field effect.")
-			gmraAboutItem("Near Clip", "How close something can get to the camera before it gets cut off.")
-			gmraAboutItem("POV", "Makes the camera follow a player view instead of freecam keys.")
-			gmraAboutItem("Replay Speed", "Changes how fast the replay itself moves.")
-			gmraAboutItem("Timeline Speed", "Changes how fast your camera animation moves.")
-		elseif aboutActiveTab == "tips" then
-			gmraAboutHeader("Easy Wins")
-			gmraAboutItem("Build First", "Keep Preview Camera off while placing keys.")
-			gmraAboutItem("Check After", "Turn Preview Camera on when you want to judge the shot.")
-			gmraAboutItem("Use Freecam Edit", "Best for placing and live-editing keys from the camera.")
-			gmraAboutItem("Use Recording Mode", "Good when you want fewer overlays while recording.")
+			gmraAboutItem("Near Clip", "How close something can get before it gets cut off.")
+			gmraAboutItem("POV vs Freecam", "POV follows a player's view. Freecam keys are your own path.")
+			gmraAboutItem("Replay vs Timeline Speed", "Replay speed = how fast the replay moves. Timeline speed = how fast your camera animation moves.")
+			gmraUnindentBlock()
+		end
+		if Gui.collapsingHeader(gmraIcon("Lightbulb") .. " Tips & Gotchas##helpTips") then
+			gmraIndentBlock()
 			gmraAboutHeader("Replay Layers")
 			gmraAboutItem("Layer Basics", "Each layer is its own replay source and timing strip.")
-			gmraAboutItem("Mute", "Hide one replay layer without deleting it.")
-			gmraAboutItem("Solo", "Only show the layers that have Solo on.")
-			gmraAboutItem("Replay Freeze", "Use it when you want the replay to pause for part of the shot.")
+			gmraAboutItem("Mute / Solo", "Mute hides one layer. Solo shows only the soloed layers.")
+			gmraAboutItem("Clear vs Unload", "Clear Layer also frees the replay from memory if no other layer uses it. Unload Selected frees any picked replay.")
 			gmraAboutHeader("Common Confusions")
-			gmraAboutItem("Depth Of Field", "DOF is a preview effect. Judge it with Preview Camera on.")
-			gmraAboutItem("Replay Speed", "Changes replay source time speed.")
-			gmraAboutItem("Timeline Speed", "Changes animation play speed.")
-			gmraAboutItem("POV", "Best for player follow shots and player camera views.")
-			gmraAboutItem("Free Camera", "Best for big cinematic moves.")
-			gmraAboutItem("Replay Bars", "The bars at the bottom show replay timing, but you edit them with controls, not by dragging.")
-			gmraAboutHeader("If You Get Lost")
-			gmraAboutItem("Open These", "Project -> Timeline -> Add Keys -> Selected Key Editor")
-		else
-			gmraAboutHeader("Quick Start")
-			gmraAboutStep("1", "Project", "Make or load a project.")
-			gmraAboutStep("2", "Replay", "Add a replay layer and bind a replay.")
-			gmraAboutStep("3", "Keys", "Use Add Key Type to place the keys you need.")
-			gmraAboutStep("4", "Edit", "Click a key to change it.")
-			gmraAboutStep("5", "Preview", "Turn Preview Camera on.")
-			gmraAboutStep("6", "Record", "Record when it looks good.")
-			gmraAboutHeader("What This Is")
-			gmraAboutItem("Simple Version", "A tool for making replay camera shots.")
-			gmraAboutItem(
-				"Think Of It Like",
-				"Project = shot, Timeline = motion, Add Keys = new keys, Editor = selected key."
-			)
+			gmraAboutItem("Post FX", "These are preview effects - judge them with Preview ON.")
+			gmraAboutItem("Replay Bars", "They show replay timing, but you edit them with the controls, not by dragging.")
+			gmraUnindentBlock()
 		end
-
 		gmraUnindentBlock()
 	end
 end
@@ -5681,11 +6232,23 @@ function gmraDrawReplayFreezeAddBuilder(p: Project)
 end
 
 function gmraDrawReplaysSection(p: Project)
-	if Gui.collapsingHeader("Replays") then
+	do
 		gmraIndentBlock()
-		gmraIndentBlock()
-		Gui.text("Load replays in F6, then bind them here.")
-		if Gui.button("Add Layer##addLayer") then
+		if gmraPendingBindName ~= "" then
+			if gmraIsReplayLoaded(gmraPendingBindName) then
+				bindLayerToLoadedReplay(p, clamp(gmraPendingBindLayer, 1, #p.replayLayers), gmraPendingBindName)
+				replayTestStatus = "Bound '" .. gmraPendingBindName .. "'."
+				gmraPendingBindName = ""
+			else
+				gmraPendingBindFrames -= 1
+				if gmraPendingBindFrames <= 0 then
+					replayTestStatus = "Could not load '" .. gmraPendingBindName .. "'. Open Replay (F6), Load it, then Bind."
+					gmraPendingBindName = ""
+				end
+			end
+		end
+		gmraSectionLabel(gmraIcon("LayerGroup") .. " Layers")
+		if Gui.button(gmraIcon("Plus") .. " Add Layer##addLayer") then
 			pushUndoOnce(p)
 			table.insert(p.replayLayers, {
 				name = "Replay Layer " .. tostring(#p.replayLayers + 1),
@@ -5696,55 +6259,110 @@ function gmraDrawReplaysSection(p: Project)
 			})
 			p.ui.selectedReplayLayerId = #p.replayLayers
 		end
-		if Gui.button("Remove Selected Layer##rmLayer") then
+		Gui.sameLine()
+		if Gui.button(gmraIcon("Trash") .. " Remove Layer##rmLayer") then
 			pushUndoOnce(p)
 			removeReplayLayer(p, clamp(p.ui.selectedReplayLayerId, 1, #p.replayLayers))
 		end
+		Gui.setNextItemWidth(220)
 		p.ui.selectedReplayLayerId =
-			Gui.sliderInt("Active Replay Layer##selLayer", p.ui.selectedReplayLayerId, 1, #p.replayLayers)
-		local L = p.replayLayers[clamp(p.ui.selectedReplayLayerId, 1, #p.replayLayers)]
+			Gui.sliderInt("Active Layer##selLayer", p.ui.selectedReplayLayerId, 1, #p.replayLayers)
+		local layerIdx = clamp(p.ui.selectedReplayLayerId, 1, #p.replayLayers)
+		local L = p.replayLayers[layerIdx]
 		if L then
-			Gui.separator() -- layer
 			L.muted = Gui.checkbox("Mute##mute", L.muted == true)
+			Gui.sameLine()
 			L.solo = Gui.checkbox("Solo##solo", L.solo == true)
 			local seg = (L.segments and L.segments[1]) or nil
-			local loaded = Replay.listLoaded()
-			Gui.separator() -- Loaded Replays (from F6)
-			if #loaded == 0 then
-				Gui.text("None loaded. Open Replay (F6) and click Load.")
+			gmraSectionLabel(gmraIcon("Film") .. " Replay Library")
+			local allReplays = gmraListAllReplays()
+			Gui.setNextItemWidth(280)
+			replaySearch = Gui.inputText(gmraIcon("Search") .. " Filter##replaySearch", replaySearch)
+			if #allReplays == 0 then
+				Gui.textDisabled("No replays found in your Replays folder.")
 			else
-				if Gui.beginListBox("Loaded##loadedList") then
-					for i = 1, #loaded do
-						local nm = loaded[i]
-						local picked = (replayPicked ~= "" and string.find(nm, replayPicked, 1, true) ~= nil)
-						if Gui.selectable(nm .. "##ld", picked) then
-							replayPicked = nm
+				if Gui.beginListBox("##replayLibList") then
+					local search = string.lower(replaySearch)
+					for i = 1, #allReplays do
+						local nm = allReplays[i]
+						local show = (search == "") or (string.find(string.lower(nm), search, 1, true) ~= nil)
+						if show then
+							local prefix = gmraIsReplayLoaded(nm) and (gmraIcon("Check") .. " ") or "     "
+							if Gui.selectable(prefix .. nm .. "##rl" .. tostring(i), nm == replayPicked) then
+								replayPicked = nm
+							end
 						end
 					end
 					Gui.endListBox()
 				end
+				Gui.textDisabled(gmraIcon("Check") .. " = already loaded. Others load automatically on bind.")
 			end
-			Gui.separator()
-			if Gui.button("Bind Active Layer To Loaded Replay##bindLoaded") then
-				if replayPicked ~= "" then
-					pushUndoOnce(p)
-					if getLoadedReplayIndexByName(replayPicked) then
-						bindLayerToLoadedReplay(p, clamp(p.ui.selectedReplayLayerId, 1, #p.replayLayers), replayPicked)
-					end
+			local canBind = replayPicked ~= ""
+			if not canBind then
+				Gui.beginDisabled()
+			end
+			if gmraColoredToggle("loadBind", true, GMRA_COL_PREVIEW, gmraIcon("Link") .. " Load & Bind To Active Layer") then
+				pushUndoOnce(p)
+				if gmraEnsureReplayLoaded(replayPicked) then
+					bindLayerToLoadedReplay(p, layerIdx, replayPicked)
+					replayTestStatus = "Bound '" .. replayPicked .. "' to layer " .. tostring(layerIdx) .. "."
+				else
+					-- Replay.load may be async; finish the bind once it appears (see pending check above).
+					gmraPendingBindName = replayPicked
+					gmraPendingBindLayer = layerIdx
+					gmraPendingBindFrames = 180
+					replayTestStatus = "Loading '" .. replayPicked .. "'..."
 				end
 			end
-			if Gui.button("Clear Active Layer Replay##clearSeg") then
+			if not canBind then
+				Gui.endDisabled()
+			end
+			Gui.sameLine()
+			if Gui.button(gmraIcon("Unlink") .. " Clear Layer##clearSeg") then
 				pushUndoOnce(p)
+				local clearedName = (seg and seg.replayName) or ""
 				clearArray(L.segments)
 				L.freezes = {}
-				if p.ui.masterReplayName == (seg and seg.replayName or "") then
+				if p.ui.masterReplayName == clearedName then
 					p.ui.masterReplayName = ""
 				end
+				if clearedName ~= "" and not gmraReplayNameStillUsed(p, clearedName, nil) then
+					if gmraUnloadReplayByName(clearedName) then
+						replayTestStatus = "Cleared layer and unloaded '" .. clearedName .. "'."
+					else
+						replayTestStatus = "Cleared layer."
+					end
+				elseif clearedName ~= "" then
+					replayTestStatus = "Cleared layer. '" .. clearedName .. "' kept loaded (another layer uses it)."
+				else
+					replayTestStatus = "Cleared layer."
+				end
 			end
-			Gui.separator() -- Active Layer Segment
+			Gui.sameLine()
+			local canUnloadSel = replayPicked ~= "" and gmraIsReplayLoaded(replayPicked)
+			if not canUnloadSel then
+				Gui.beginDisabled()
+			end
+			if Gui.button(gmraIcon("Trash") .. " Unload Selected##unloadSel") then
+				if gmraReplayNameStillUsed(p, replayPicked, nil) then
+					replayTestStatus = "'" .. replayPicked .. "' is bound to a layer. Clear that layer first."
+				elseif gmraUnloadReplayByName(replayPicked) then
+					replayTestStatus = "Unloaded '" .. replayPicked .. "'."
+				else
+					replayTestStatus = "Could not unload '" .. replayPicked .. "'."
+				end
+			end
+			if not canUnloadSel then
+				Gui.endDisabled()
+			end
+			Gui.setItemTooltip("Free the selected replay from memory (only if no layer is using it).")
+			if replayTestStatus ~= "" then
+				Gui.textDisabled(replayTestStatus)
+			end
 			seg = (L.segments and L.segments[1]) or nil
+			gmraSectionLabel(gmraIcon("Cut") .. " Timing")
 			if seg then
-				Gui.text("Assigned: " .. seg.replayName)
+				Gui.textColored(GMRA_COL_ACCENT, gmraIcon("Check") .. " Bound: " .. seg.replayName)
 				seg.dstStart = alignTo(
 					Gui.dragFloat(
 						"Timeline Start##dst",
@@ -5773,32 +6391,22 @@ function gmraDrawReplaysSection(p: Project)
 				)
 				seg.srcStart = clamp(newSrcStart, 0, prevSrcEnd - 0.01)
 				seg.srcEnd = math.max(newSrcEnd, prevSrcStart + 0.01)
-				local mapped = replayTimeForLayerAtPlayhead(
-					p,
-					clamp(p.ui.selectedReplayLayerId, 1, #p.replayLayers),
-					seg,
-					playhead
-				)
-				Gui.text(string.format("At timeline %.3f -> replay %.3f", playhead, mapped))
-				Gui.separator()
-				Gui.text("Replay Freeze")
-				Gui.text("Use Add Key Type -> Replay Freeze to add one.")
-				Gui.text("Replay bars are locked. Use Timeline Start and Active Freezes to edit them.")
+				local mapped = replayTimeForLayerAtPlayhead(p, layerIdx, seg, playhead)
+				Gui.textDisabled(string.format("At timeline %.3f -> replay %.3f", playhead, mapped))
+				Gui.textDisabled("Freezes: add via Add Key -> Replay Freeze. Replay bars are view-only.")
 			else
-				Gui.text("Assigned: (none)")
-				Gui.separator()
-				Gui.text("Replay Freeze")
-				Gui.text("Bind a replay to this layer before adding freezes.")
+				Gui.textDisabled("No replay bound. Pick one above, then Load & Bind.")
 			end
 		end
-		gmraUnindentBlock()
 		gmraUnindentBlock()
 	end
 end
 function gmraDrawSettingsSection(p: Project)
-	if Gui.collapsingHeader("Settings") then
+	do
 		gmraIndentBlock()
-		if Gui.collapsingHeader("Timeline##cfgTimelineSection") then
+		Gui.textDisabled("Global options. These are saved and apply to every project.")
+		Gui.spacing()
+		if Gui.collapsingHeader(gmraIcon("Clock") .. " Timeline##cfgTimelineSection") then
 			gmraIndentBlock()
 			local prevSnap = globalSnapStep
 			globalSnapStep = Gui.dragFloat("Snap Step (seconds)##cfgSnap", globalSnapStep, 0.01, 0, 1)
@@ -5833,6 +6441,13 @@ function gmraDrawSettingsSection(p: Project)
 				p.ui.scrollSpeed = globalAutoScrollSpeed
 				safeSaveConfig()
 			end
+			local prevUndo = math.floor(tonumber(config.undoLimit) or 20)
+			local newUndo = safeSliderInt("Undo Steps##cfgUndoLimit", prevUndo, 1, 100)
+			if newUndo ~= prevUndo then
+				config.undoLimit = newUndo
+				safeSaveConfig()
+			end
+			gmraTooltip("How many changes the Undo button / Ctrl+Z can step back through.")
 			local prevTlInPreview = config.previewTimelineInPreview == true
 			local tlInPreview =
 				Gui.checkbox("Enable Timeline While Preview Camera Is ON##cfgTlInPreview", prevTlInPreview)
@@ -5840,9 +6455,16 @@ function gmraDrawSettingsSection(p: Project)
 				config.previewTimelineInPreview = tlInPreview
 				safeSaveConfig()
 			end
+			local prevDriveReplays = driveReplays
+			driveReplays = Gui.checkbox("Drive Replays During Playback##cfgDriveReplays", driveReplays)
+			gmraTooltip("ON = the timeline scrubs the bound replay(s). OFF = leave replays where they are.")
+			if prevDriveReplays ~= driveReplays then
+				config.driveReplays = driveReplays
+				safeSaveConfig()
+			end
 			gmraUnindentBlock()
 		end
-		if Gui.collapsingHeader("World Draw / Preview##cfgWorldDrawSection") then
+		if Gui.collapsingHeader(gmraIcon("Eye") .. " World Draw / Preview##cfgWorldDrawSection") then
 			gmraIndentBlock()
 			local prevShowPath = showPath
 			showPath = Gui.checkbox("Show Camera Path In World##path", showPath)
@@ -5926,12 +6548,12 @@ function gmraDrawSettingsSection(p: Project)
 			end
 			gmraUnindentBlock()
 		end
-		if Gui.collapsingHeader("Keybinds##cfgSettingsKeybinds") then
+		if Gui.collapsingHeader(gmraIcon("Keyboard") .. " Keybinds##cfgSettingsKeybinds") then
 			gmraIndentBlock()
 			gmraDrawKeybindSettings(false)
 			gmraUnindentBlock()
 		end
-		if Gui.collapsingHeader("Debug##cfgDebugSection") then
+		if Gui.collapsingHeader(gmraIcon("Bug") .. " Debug##cfgDebugSection") then
 			gmraIndentBlock()
 			local prevApplyPos = debugPreviewApplyPosition
 			debugPreviewApplyPosition =
@@ -5996,6 +6618,11 @@ local laneNonce = {
 	dofFstop = 0,
 	dofFocalDistance = 0,
 	dofSensorWidth = 0,
+	motionBlur = 0,
+	vignette = 0,
+	exposure = 0,
+	bloom = 0,
+	chromatic = 0,
 	speed = 0,
 	tlspeed = 0,
 	pov = 0,
@@ -6022,57 +6649,224 @@ function gmraInvalidateLaneWidgets()
 	dragLastDeltaByLane = {}
 	wasDraggingLane = {}
 end
+function gmraBuildExportData(p: Project, frames, fps: number, markerFrames: { number })
+	local camName = string.gsub(tostring(p.projectName or "AnimCam"), "[^%w_]", "_")
+	if camName == "" then
+		camName = "AnimCam"
+	end
+	local framesArr = {}
+	for i = 1, #frames do
+		local fr = frames[i]
+		framesArr[i] = { fr.px, fr.py, fr.pz, fr.fx, fr.fy, fr.fz, fr.ux, fr.uy, fr.uz, fr.fov, fr.dofFocal, fr.dofFstop }
+	end
+	return {
+		format = "advanced_animator_camera",
+		version = 2,
+		name = camName,
+		fps = math.max(1, math.floor(fps)),
+		frameCount = #frames,
+		timelineStart = p.timelineStart,
+		timelineEnd = p.timelineEnd,
+		scaleHint = 0.01,
+		fovAxis = "horizontal",
+		markers = markerFrames or {},
+		frames = framesArr,
+	}
+end
+function gmraStartBlenderExport(p: Project)
+	if gmraExportActive then
+		return
+	end
+	local fps = math.max(1, math.floor(gmraExportFps))
+	local dur = math.max(0, p.timelineEnd - p.timelineStart)
+	-- Rough estimate at 1x for the safety cap only; the real count depends on the
+	-- Timeline Speed warp and is discovered as we bake.
+	gmraExportTotalFrames = math.floor(dur * fps + 0.5) + 1
+	gmraExportMaxFrames = math.min(200000, math.max(gmraExportTotalFrames * 20, 6000))
+	gmraExportFrames = {}
+	gmraExportFrameIdx = 0
+	gmraExportSavedPlayhead = playhead
+	gmraExportSavedAnimating = animating
+	gmraExportSavedPreview = previewEnabled
+	animating = false
+	previewEnabled = false
+	pcall(function()
+		alwaysTick = true
+	end)
+	-- Markers are recorded during the bake (when the warped playhead reaches each key
+	-- time) so they land on the correct output frame even with speed ramps.
+	gmraExportMarkerFrames = {}
+	gmraExportKeyTimes = gmraGatherLabeledKeyTimes(p)
+	gmraExportKeyIdx = 1
+	gmraExportPlayhead = p.timelineStart
+	gmraExportActive = true
+	gmraExportSettle = gmraExportSettleMax
+	gmraExportStatus = "Baking..."
+	playhead = p.timelineStart
+end
+function gmraFinishBlenderExport(p: Project)
+	local ok, err = pcall(function()
+		-- Store the baked timeline in the script config (config.exports), keyed by the
+		-- project name. The Blender addon reads the config file directly - no separate
+		-- export files, so renaming/deleting a project just updates config here.
+		if type(config.exports) ~= "table" then
+			config.exports = {}
+		end
+		config.exports[p.projectName] = gmraBuildExportData(p, gmraExportFrames, gmraExportFps, gmraExportMarkerFrames)
+		safeSaveConfig()
+		gmraExportStatus = string.format("Exported %d frames for '%s'. Load it in the Blender addon.", #gmraExportFrames, tostring(p.projectName))
+	end)
+	if not ok then
+		gmraExportStatus = "Export error: " .. tostring(err)
+	end
+	gmraExportActive = false
+	playhead = gmraExportSavedPlayhead
+	animating = gmraExportSavedAnimating
+	-- Land in Preview after a bake so you immediately see the shot you exported.
+	previewEnabled = true
+	pcall(function()
+		alwaysTick = false
+	end)
+	pcall(gmraResetAppliedPostFx)
+	gmraExportFrames = {}
+end
+function gmraCancelBlenderExport()
+	if not gmraExportActive then
+		return
+	end
+	gmraExportActive = false
+	playhead = gmraExportSavedPlayhead
+	animating = gmraExportSavedAnimating
+	previewEnabled = gmraExportSavedPreview
+	pcall(function()
+		alwaysTick = false
+	end)
+	pcall(gmraResetAppliedPostFx)
+	gmraExportFrames = {}
+	gmraExportStatus = "Export cancelled."
+end
+function gmraTickBlenderExport(p: Project, dt: number)
+	local fps = math.max(1, math.floor(gmraExportFps))
+	local t = gmraExportPlayhead
+	if t > p.timelineEnd then
+		t = p.timelineEnd
+	end
+	playhead = t
+	camera.positionSmoothing = 0
+	camera.rotationSmoothing = 0
+	camera.fieldOfViewSmoothing = 0
+	driveReplaysAtTime(p, t, dt)
+	if gmraExportSettle > 0 then
+		gmraExportSettle -= 1
+		return
+	end
+	evalAndApplyCamera(p, t)
+	local finalPos = camera.position
+	local finalRot = camera.rotation
+	local fwd = quatForward(finalRot)
+	local up = quatUp(finalRot, fwd)
+	local fov = (#p.tracks.fov > 0) and evalNum(p.tracks.fov, t) or 90
+	local dofFocal = (#(p.tracks.dofFocalDistance or {}) > 0) and math.max(0, evalNum(p.tracks.dofFocalDistance, t)) or 0
+	local dofFstop = (#(p.tracks.dofFstop or {}) > 0) and math.max(0, evalNum(p.tracks.dofFstop, t)) or 0
+	gmraExportFrames[#gmraExportFrames + 1] = {
+		px = finalPos.x,
+		py = finalPos.y,
+		pz = finalPos.z,
+		fx = fwd.x,
+		fy = fwd.y,
+		fz = fwd.z,
+		ux = up.x,
+		uy = up.y,
+		uz = up.z,
+		fov = fov,
+		dofFocal = dofFocal,
+		dofFstop = dofFstop,
+	}
+	gmraExportFrameIdx += 1
+	-- Drop a marker on this output frame for every keyframe time the warped playhead
+	-- has reached (times are sorted; the playhead only moves forward).
+	while
+		gmraExportKeyIdx <= #gmraExportKeyTimes and t >= (gmraExportKeyTimes[gmraExportKeyIdx].t - 1e-6)
+	do
+		gmraExportMarkerFrames[#gmraExportMarkerFrames + 1] =
+			{ gmraExportFrameIdx, gmraExportKeyTimes[gmraExportKeyIdx].label }
+		gmraExportKeyIdx += 1
+	end
+	gmraExportSettle = gmraExportSettleMax
+	local denom = math.max(1e-6, p.timelineEnd - p.timelineStart)
+	gmraExportStatus =
+		string.format("Baking... %d%%  (frame %d)", math.floor((t - p.timelineStart) / denom * 100 + 0.5), gmraExportFrameIdx)
+	if t >= p.timelineEnd - 1e-6 or gmraExportFrameIdx >= gmraExportMaxFrames then
+		gmraFinishBlenderExport(p)
+		return
+	end
+	-- Advance the playhead by Timeline Speed so the exported pacing (ramps, slow-mo)
+	-- matches live playback: playhead += (1/fps) * timelineSpeed.
+	local tlSpeed = evalNum(p.tracks.timelineSpeed, t)
+	if tlSpeed <= 0 then
+		tlSpeed = 0.01
+	end
+	gmraExportPlayhead = math.min(p.timelineEnd, t + (1 / fps) * tlSpeed)
+end
+function gmraDrawProjectManager()
+	local names = getProjectNames()
+	local curName = projectNameInput
+	if curName == "" and #names > 0 then
+		curName = names[1]
+	end
+	-- Keep the Rename field pre-filled with the active project's name, refreshed
+	-- whenever the active project changes (so you edit the current name to rename).
+	if gmraRenameLastProject ~= projectNameInput then
+		gmraRenameProjectInput = projectNameInput
+		gmraRenameLastProject = projectNameInput
+	end
+	Gui.setNextItemWidth(-1)
+	if Gui.beginCombo("##curCombo", curName ~= "" and curName or "(none)") then
+		for i = 1, #names do
+			local nm = names[i]
+			if Gui.selectable(nm .. "##p" .. tostring(i), nm == curName) then
+				projectNameInput = nm
+				loadProjectByName(nm)
+			end
+		end
+		Gui.endCombo()
+	end
+	Gui.setNextItemWidth(-95)
+	gmraRenameProjectInput = Gui.inputText("##renameProj", gmraRenameProjectInput)
+	Gui.sameLine()
+	if Gui.button(gmraIcon("Edit") .. " Rename##projRename") then
+		if gmraRenameProject(projectNameInput, gmraRenameProjectInput) then
+			projectNameInput = gmraTrimName(gmraRenameProjectInput)
+			gmraRenameLastProject = projectNameInput
+		end
+	end
+	Gui.setNextItemWidth(-95)
+	newProjectNameInput = Gui.inputText("##newProj", newProjectNameInput)
+	Gui.sameLine()
+	if Gui.button(gmraIcon("Plus") .. " New##projNew") then
+		project = makeEmptyProject(newProjectNameInput ~= "" and newProjectNameInput or "Untitled")
+		projectNameInput = (project :: Project).projectName
+		saveProject(project :: Project)
+		newProjectNameInput = ""
+	end
+	if gmraColoredToggle("projDelete", true, GMRA_COL_REC, gmraIcon("Trash") .. " Delete Project") then
+		gmraDeleteProjectByName(projectNameInput)
+	end
+end
 function onGuiImpl()
-	Gui.separator() -- Replay Camera Animator
-	Gui.text("Mode: " .. mode .. (animating and " (playing)" or ""))
+	local headerProjName = (project and (project :: Project).projectName) or "(no project)"
+	local headerText = gmraIcon("Film") .. " Advanced Animator   |   " .. headerProjName .. "   |   " .. mode
+	if animating then
+		Gui.textColored(LinearColor.new(0.45, 1.0, 0.55, 1.0), headerText .. "  (playing)")
+	elseif previewEnabled then
+		Gui.textColored(LinearColor.new(0.55, 0.8, 1.0, 1.0), headerText)
+	else
+		Gui.textDisabled(headerText)
+	end
 	Gui.separator()
-	gmraDrawAboutSection()
 	if Gui.collapsingHeader("Project") then
 		gmraIndentBlock()
-		local names = getProjectNames()
-		local curName = projectNameInput
-		if curName == "" and #names > 0 then
-			curName = names[1]
-		end
-		if Gui.beginCombo("Current Project##curCombo", curName ~= "" and curName or "(none)") then
-			for i = 1, #names do
-				local nm = names[i]
-				if Gui.selectable(nm .. "##p" .. tostring(i), nm == curName) then
-					projectNameInput = nm
-				end
-			end
-			Gui.endCombo()
-		end
-		if Gui.button("Load Project##proj") then
-			if projectNameInput ~= "" then
-				loadProjectByName(projectNameInput)
-			end
-		end
-		Gui.sameLine()
-		if Gui.button("Save Project##proj") and project then
-			saveProject(project :: Project)
-		end
-		Gui.sameLine()
-		if Gui.button("Delete Project##proj") then
-			local name = projectNameInput
-			if name ~= "" and config.projects and config.projects[name] then
-				config.projects[name] = nil
-				if project and (project :: Project).projectName == name then
-					project = nil
-					projectNameInput = ""
-				end
-				if config.lastProject == name then
-					config.lastProject = ""
-				end
-				safeSaveConfig()
-			end
-		end
-		newProjectNameInput = Gui.inputText("New Project Name##new", newProjectNameInput)
-		if Gui.button("Create New Project##proj") then
-			project = makeEmptyProject(newProjectNameInput ~= "" and newProjectNameInput or "Untitled")
-			projectNameInput = (project :: Project).projectName
-			saveProject(project :: Project)
-		end
+		gmraDrawProjectManager()
 		gmraUnindentBlock()
 	end
 	if not project then
@@ -6086,31 +6880,21 @@ function onGuiImpl()
 	p.timelineStart = globalTimelineStart
 	p.timelineEnd = math.max(globalTimelineEnd, p.timelineStart + 0.1)
 	p.ui.scrollSpeed = globalAutoScrollSpeed
-	if Gui.collapsingHeader("Timeline") then
-		gmraIndentBlock()
-		Gui.separator() -- Timeline
-		local _iconPause = (type(Icon) == "table" and Icon.Pause) or "||"
-		local _iconPlay = (type(Icon) == "table" and Icon.Play) or ">"
+	do
+		local _iconPause = gmraIcon("Pause")
+		local _iconPlay = gmraIcon("Play")
 		local playLabel = animating and (_iconPause .. " Pause") or (_iconPlay .. " Play")
-		if Gui.button(playLabel .. "##playPause") then
+		if gmraColoredToggle("playPause", true, animating and GMRA_COL_PAUSE or GMRA_COL_PLAY, playLabel) then
 			animating = not animating
 		end
 		Gui.sameLine()
-		if Gui.button("Undo##undo") then
-			doUndo()
-		end
-		Gui.sameLine()
-		Gui.text(string.format("Playhead: %.3fs", playhead))
-		if Gui.button((previewEnabled and "Preview: ON" or "Preview: OFF") .. "##previewToggle") then
+		local previewLabel = (previewEnabled and gmraIcon("Video") or gmraIcon("VideoSlash")) .. " Preview"
+		if gmraColoredToggle("previewToggle", previewEnabled, GMRA_COL_PREVIEW, previewLabel) then
 			previewEnabled = not previewEnabled
 		end
+		Gui.setItemTooltip("Drive the camera entirely from the timeline.")
 		Gui.sameLine()
-		if Gui.button((editing and "Freecam: ON" or "Freecam: OFF") .. "##freecamEdit") then
-			editing = not editing
-		end
-		Gui.sameLine()
-		Gui.setItemTooltip("ON = follow freecam while editing. OFF = no freecam follow.")
-		if Gui.button((recordingModeProfile and "Recording: ON" or "Recording: OFF") .. "##timelineRecordingMode") then
+		if gmraColoredToggle("timelineRecordingMode", recordingModeProfile, GMRA_COL_REC, gmraIcon("Circle") .. " REC") then
 			recordingModeProfile = not recordingModeProfile
 			config.recordingModeProfile = recordingModeProfile
 			safeSaveConfig()
@@ -6118,16 +6902,27 @@ function onGuiImpl()
 				WorldDraw.clear()
 			end
 		end
-		Gui.separator()
-		if Gui.button("Copy##clipCopy") then
+		Gui.setItemTooltip("Hide the path/overlays for a clean capture.")
+		Gui.sameLine()
+		if Gui.button(gmraIcon("Undo") .. " Undo##undo") then
+			doUndo()
+		end
+		Gui.sameLine()
+		Gui.textColored(GMRA_COL_ACCENT, string.format("  %.3f s", playhead))
+	end
+	if Gui.beginTabBar("gmraMainTabs") then
+		if Gui.beginTabItem("Timeline") then
+			gmraIndentBlock()
+		gmraSectionLabel(gmraIcon("Clone") .. " Clipboard")
+		if Gui.button(gmraIcon("Copy") .. " Copy##clipCopy") then
 			copySelectedKeysToClipboard(p)
 		end
 		Gui.sameLine()
-		if Gui.button("Paste##clipPaste") then
+		if Gui.button(gmraIcon("Paste") .. " Paste##clipPaste") then
 			pasteClipboardAtPlayhead(p, playhead)
 		end
 		Gui.sameLine()
-		if Gui.button("Duplicate##clipDup") then
+		if Gui.button(gmraIcon("Clone") .. " Duplicate##clipDup") then
 			duplicateSelectedKeysForward(p)
 		end
 		if keyClipboardRow ~= "" and #keyClipboardEntries > 0 then
@@ -6146,12 +6941,13 @@ function onGuiImpl()
 			Gui.sameLine()
 			Gui.text("Clip: empty")
 		end
-		Gui.separator()
+		gmraSectionLabel(gmraIcon("Plus") .. " Add Key")
 		local replaySpeedVal = evalNum(p.tracks.speed, playhead)
 		local tlSpeedVal = evalNum(p.tracks.timelineSpeed, playhead)
+		Gui.setNextItemWidth(200)
 		addKeyTypeIndex = comboIndex("Type##qq_keyType", addKeyTypeIndex, addKeyTypeOptions)
 		Gui.sameLine()
-		if Gui.button("Add Pos+Rot+FOV##qq_prf") then
+		if Gui.button(gmraIcon("Plus") .. " Add Pos+Rot+FOV##qq_prf") then
 			pushUndoOnce(p)
 			writePositionKey(p, playhead)
 			writeRotationKey(p, playhead)
@@ -6182,23 +6978,63 @@ function onGuiImpl()
 				local tt = alignTo(playhead, p.snap)
 				upsertNumKey(p.tracks.fov, tt, clamp(addFovValue, 1, 179), "smooth")
 			end
-		elseif addKeyType == "Depth Of Field" then
+		elseif addKeyType == "Post FX" then
+			postFxParamIndex = comboIndex("Post FX Parameter##qq_postFxParam", postFxParamIndex, postFxParamOptions)
+			local postFxParam = postFxParamOptions[postFxParamIndex] or "Depth Of Field"
 			gmraIndentBlock()
-			addDofFstopValue = Gui.dragFloat("F-Stop Value##qq_dofFstop", addDofFstopValue, 0.05, 0, 256)
-			addDofFocalDistanceValue =
-				Gui.dragFloat("Focal Distance##qq_dofFocal", addDofFocalDistanceValue, 0.1, 0, 100000)
-			addDofSensorWidthValue = Gui.dragFloat("Sensor Width##qq_dofSensor", addDofSensorWidthValue, 0.1, 0, 10000)
-			if Gui.button("Get Current DOF##qq_useCurrentDof") then
-				local curFstop, curFocalDistance, curSensorWidth = gmraReadCurrentDOF()
-				addDofFstopValue = curFstop
-				addDofFocalDistanceValue = curFocalDistance
-				addDofSensorWidthValue = curSensorWidth
+			if postFxParam == "Depth Of Field" then
+				addDofFstopValue = Gui.dragFloat("F-Stop Value##qq_dofFstop", addDofFstopValue, 0.05, 0, 256)
+				addDofFocalDistanceValue =
+					Gui.dragFloat("Focal Distance##qq_dofFocal", addDofFocalDistanceValue, 0.1, 0, 100000)
+				addDofSensorWidthValue =
+					Gui.dragFloat("Sensor Width##qq_dofSensor", addDofSensorWidthValue, 0.1, 0, 10000)
+				if Gui.button("Get Current DOF##qq_useCurrentDof") then
+					local curFstop, curFocalDistance, curSensorWidth = gmraReadCurrentDOF()
+					addDofFstopValue = curFstop
+					addDofFocalDistanceValue = curFocalDistance
+					addDofSensorWidthValue = curSensorWidth
+				end
+				if Gui.button("Add Depth Of Field Keys @ Playhead##qq_dofInline") then
+					pushUndoOnce(p)
+					writeDOFKeys(p, playhead, addDofFstopValue, addDofFocalDistanceValue, addDofSensorWidthValue)
+				end
+			elseif postFxParam == "Motion Blur" then
+				addMotionBlurValue = safeSliderFloat("Motion Blur (0-1)##qq_mblur", addMotionBlurValue, 0, 1)
+				Gui.text("0 = off. Good for fast camera moves in recorded shots.")
+				if Gui.button("Add Motion Blur Key @ Playhead##qq_mblurInline") then
+					pushUndoOnce(p)
+					upsertNumKey(p.tracks.motionBlur, alignTo(playhead, p.snap), clamp(addMotionBlurValue, 0, 1), "smooth")
+				end
+			elseif postFxParam == "Vignette" then
+				addVignetteValue = safeSliderFloat("Vignette (0-1)##qq_vig", addVignetteValue, 0, 1)
+				Gui.text("Darkened corners. 0 = off.")
+				if Gui.button("Add Vignette Key @ Playhead##qq_vigInline") then
+					pushUndoOnce(p)
+					upsertNumKey(p.tracks.vignette, alignTo(playhead, p.snap), clamp(addVignetteValue, 0, 1), "smooth")
+				end
+			elseif postFxParam == "Exposure" then
+				addExposureValue = safeSliderFloat("Exposure Bias (EV)##qq_exp", addExposureValue, -4, 4)
+				Gui.text("0 = neutral. -1 = 2x darker, +1 = 2x brighter.")
+				if Gui.button("Add Exposure Key @ Playhead##qq_expInline") then
+					pushUndoOnce(p)
+					upsertNumKey(p.tracks.exposure, alignTo(playhead, p.snap), clamp(addExposureValue, -8, 8), "smooth")
+				end
+			elseif postFxParam == "Bloom" then
+				addBloomValue = safeSliderFloat("Bloom Intensity##qq_bloom", addBloomValue, 0, 8)
+				Gui.text("1 = engine default. 0 = off, >1 = brighter glow.")
+				if Gui.button("Add Bloom Key @ Playhead##qq_bloomInline") then
+					pushUndoOnce(p)
+					upsertNumKey(p.tracks.bloom, alignTo(playhead, p.snap), math.max(0, addBloomValue), "smooth")
+				end
+			else
+				addChromaticValue = safeSliderFloat("Chromatic Aberration (%)##qq_chroma", addChromaticValue, 0, 5)
+				Gui.text("Color fringing at the edges. 0 = off.")
+				if Gui.button("Add Chromatic Aberration Key @ Playhead##qq_chromaInline") then
+					pushUndoOnce(p)
+					upsertNumKey(p.tracks.chromatic, alignTo(playhead, p.snap), math.max(0, addChromaticValue), "smooth")
+				end
 			end
 			gmraUnindentBlock()
-			if Gui.button("Add Depth Of Field Keys @ Playhead##qq_dofInline") then
-				pushUndoOnce(p)
-				writeDOFKeys(p, playhead, addDofFstopValue, addDofFocalDistanceValue, addDofSensorWidthValue)
-			end
 		elseif addKeyType == "Replay Speed" then
 			gmraIndentBlock()
 			replaySpeedVal = Gui.dragFloat("Replay Speed Value##qq_replaySpdVal", replaySpeedVal, 0.05, 0.05, 10)
@@ -6339,7 +7175,10 @@ function onGuiImpl()
 			Gui.tableNextColumn()
 			local playheadBeforeScrub = playhead
 			if hasFn("timeline") then
-				local timelineSnap = (animating and previewEnabled) and 0 or p.snap
+				-- No snapping while playing: the per-frame advance (~0.016s) is smaller than the
+				-- snap step, so snapping would round the playhead back to the same grid point every
+				-- frame and it would never move. Snap only applies while paused, for precise scrubbing.
+				local timelineSnap = animating and 0 or p.snap
 				playhead = Gui.timeline("timeline##track", playhead, rangeStartRounded, p.ui.rangeEnd, timelineSnap)
 			else
 				playhead = Gui.sliderFloat("Playhead (s)##ph_track", playhead, rangeStartRounded, p.ui.rangeEnd)
@@ -6509,9 +7348,6 @@ function onGuiImpl()
 				drawLane("Position", p.tracks.position, "pos")
 				drawLane("Rotation", p.tracks.rotation, "rot")
 				drawLane("Field of View", p.tracks.fov, "fov")
-				drawLane("DOF F-Stop", p.tracks.dofFstop, "dofFstop")
-				drawLane("DOF Focus Distance", p.tracks.dofFocalDistance, "dofFocalDistance")
-				drawLane("DOF Sensor Width", p.tracks.dofSensorWidth, "dofSensorWidth")
 				drawLane("Replay Speed", p.tracks.speed, "speed")
 				drawLane("Timeline Speed", p.tracks.timelineSpeed, "tlspeed")
 				do
@@ -6764,19 +7600,168 @@ function onGuiImpl()
 					end
 				end
 			end
+			do
+				local pfExpanded = config.postFxLaneExpanded == true
+				local effects = {
+					{ label = "DOF", n = #p.tracks.dofFstop + #p.tracks.dofFocalDistance + #p.tracks.dofSensorWidth },
+					{ label = "Blur", n = #(p.tracks.motionBlur or {}) },
+					{ label = "Vignette", n = #(p.tracks.vignette or {}) },
+					{ label = "Exposure", n = #(p.tracks.exposure or {}) },
+					{ label = "Bloom", n = #(p.tracks.bloom or {}) },
+					{ label = "Chroma", n = #(p.tracks.chromatic or {}) },
+				}
+				local totalKeys = 0
+				for _, e in ipairs(effects) do
+					totalKeys += e.n
+				end
+				Gui.tableNextRow()
+				Gui.tableNextColumn()
+				local caret = pfExpanded and gmraIcon("CaretDown") or gmraIcon("CaretRight")
+				local pfColor = (totalKeys > 0) and LinearColor.new(0.52, 0.34, 0.72, 1.0) or GMRA_COL_OFF
+				if gmraColoredToggle("postFxLaneToggle", true, pfColor, caret .. " " .. gmraIcon("Adjust") .. " Post FX") then
+					config.postFxLaneExpanded = not pfExpanded
+					safeSaveConfig()
+				end
+				Gui.setItemTooltip("Depth of field, motion blur, vignette, exposure, bloom, chromatic aberration.")
+				Gui.tableNextColumn()
+				for i = 1, #effects do
+					local e = effects[i]
+					if i > 1 then
+						Gui.sameLine()
+					end
+					if e.n > 0 then
+						Gui.textColored(LinearColor.new(0.74, 0.58, 0.96, 1.0), e.label)
+					else
+						Gui.textDisabled(e.label)
+					end
+				end
+			end
+			if config.postFxLaneExpanded == true and not pauseTrackLaneWidgets then
+				drawLane("DOF F-Stop", p.tracks.dofFstop, "dofFstop")
+				drawLane("DOF Focus Distance", p.tracks.dofFocalDistance, "dofFocalDistance")
+				drawLane("DOF Sensor Width", p.tracks.dofSensorWidth, "dofSensorWidth")
+				drawLane("Motion Blur", p.tracks.motionBlur, "motionBlur")
+				drawLane("Vignette", p.tracks.vignette, "vignette")
+				drawLane("Exposure", p.tracks.exposure, "exposure")
+				drawLane("Bloom", p.tracks.bloom, "bloom")
+				drawLane("Chromatic Aberration", p.tracks.chromatic, "chromatic")
+			end
 			Gui.endTable()
 		end
 		gmraDrawSelectedKeyEditor(p)
-		if Gui.collapsingHeader("Smoothing##interp") then
+		if Gui.collapsingHeader(gmraIcon("FileExport") .. " Export to Blender##blenderExport") then
 			gmraIndentBlock()
-			p.ui.useQuatInterp = Gui.checkbox("Use Quaternion Rotation Interpolation##quat", p.ui.useQuatInterp == true)
-			p.ui.globalSmoothing = Gui.sliderFloat("Global Smoothing Mix##gs", p.ui.globalSmoothing or 0, 0, 1)
+			Gui.textColored(
+				LinearColor.new(1.0, 0.78, 0.25, 1.0),
+				gmraIcon("ExclamationTriangle") .. " The Blender addon is a separate download - get it from the Advanced Animator page."
+			)
+			Gui.setNextItemWidth(140)
+			gmraExportFps = safeSliderInt("Export FPS##expFps", math.floor(gmraExportFps), 1, 120)
+			if math.floor(gmraExportFps) ~= math.floor(tonumber(config.exportFps) or 30) then
+				config.exportFps = math.floor(gmraExportFps)
+				safeSaveConfig()
+			end
+			local expFps = math.max(1, math.floor(gmraExportFps))
+			local estFrames = math.floor(math.max(0, p.timelineEnd - p.timelineStart) * expFps + 0.5) + 1
+			Gui.textDisabled(
+				string.format(
+					"%.2f-%.2fs at %d fps  =  ~%d frames at 1x",
+					p.timelineStart,
+					p.timelineEnd,
+					expFps,
+					estFrames
+				)
+			)
+			Gui.textDisabled("Saved into the script config, one per project. The Blender addon reads it.")
+			if gmraExportActive then
+				Gui.textColored(GMRA_COL_ACCENT, gmraExportStatus)
+				if Gui.button(gmraIcon("Times") .. " Cancel##expCancel") then
+					gmraCancelBlenderExport()
+				end
+			else
+				if gmraColoredToggle("blenderExportBtn", true, GMRA_COL_PREVIEW, gmraIcon("FileExport") .. " Bake & Export") then
+					gmraStartBlenderExport(p)
+				end
+				Gui.setItemTooltip("Plays through the timeline once to capture each frame, then writes exports/<name>.json.")
+				if gmraExportStatus ~= "" then
+					Gui.textDisabled(gmraExportStatus)
+				end
+			end
+			gmraUnindentBlock()
+		end
+			gmraUnindentBlock()
+			Gui.endTabItem()
+		end
+		if Gui.beginTabItem("Smoothing") then
+			gmraIndentBlock()
+			gmraSectionLabel(gmraIcon("Magic") .. " Quick Presets")
+			gmraWrapped("One click to smooth the whole shot. Fine-tune with the sliders below.")
+			if gmraColoredToggle("advPresetFlow", true, GMRA_COL_PREVIEW, "Flow Through") then
+				p.ui.globalSmoothing = 0.8
+				p.ui.posSmoothing = 0
+				p.ui.rotSmoothing = 0
+				p.ui.posOvershootGuard = 0.3
+				p.ui.posTangentStrength = 1
+				p.ui.posKeyflow = 0.75
+				p.ui.posTimingCarry = 1
+				p.ui.posMidBiasPower = 1
+				p.ui.posTangentClamp = 3
+				p.ui.rotKeyflow = 0.9
+				p.ui.rotLinearMix = 0
+				p.ui.rotSmoothStrength = 1
+			end
+			Gui.setItemTooltip("Loose and flowing - the path glides through keys.")
+			Gui.sameLine()
+			if gmraColoredToggle("advPresetBalanced", true, GMRA_COL_PREVIEW, "Balanced") then
+				p.ui.globalSmoothing = 0.6
+				p.ui.posSmoothing = 0
+				p.ui.rotSmoothing = 0
+				p.ui.posOvershootGuard = 0.4
+				p.ui.posTangentStrength = 1
+				p.ui.posKeyflow = 0.55
+				p.ui.posTimingCarry = 1
+				p.ui.posMidBiasPower = 1
+				p.ui.posTangentClamp = 2.5
+				p.ui.rotKeyflow = 0.75
+				p.ui.rotLinearMix = 0
+				p.ui.rotSmoothStrength = 1
+			end
+			Gui.setItemTooltip("A good default between smooth and tight.")
+			Gui.sameLine()
+			if gmraColoredToggle("advPresetSoft", true, GMRA_COL_PREVIEW, "Soft Arc") then
+				p.ui.globalSmoothing = 0.5
+				p.ui.posSmoothing = 0
+				p.ui.rotSmoothing = 0
+				p.ui.posOvershootGuard = 0.55
+				p.ui.posTangentStrength = 1
+				p.ui.posKeyflow = 0.45
+				p.ui.posTimingCarry = 1
+				p.ui.posMidBiasPower = 1
+				p.ui.posTangentClamp = 2
+				p.ui.rotKeyflow = 0.6
+				p.ui.rotLinearMix = 0
+				p.ui.rotSmoothStrength = 1
+			end
+			Gui.setItemTooltip("Gentle arcs that stay closer to your keys.")
+			if Gui.button(gmraIcon("Ban") .. " None (Straight Lines)##advPresetNone") then
+				p.ui.globalSmoothing = 0
+				p.ui.posSmoothing = 0
+				p.ui.rotSmoothing = 0
+			end
+			Gui.setItemTooltip("No smoothing - straight lines between keys.")
+			gmraSectionLabel(gmraIcon("SlidersH") .. " Blend Amount")
+			Gui.setNextItemWidth(220)
+			p.ui.globalSmoothing = Gui.sliderFloat("Overall Smoothing##gs", p.ui.globalSmoothing or 0, 0, 1)
 			gmraTooltip("Master smoothing amount. Higher makes the whole path flow more as one curve.")
-			p.ui.posSmoothing = Gui.sliderFloat("Position Curve Blend##ps", p.ui.posSmoothing or 0, 0, 1)
-			gmraTooltip("How strongly position keys are blended into one fluid camera path.")
-			p.ui.rotSmoothing = Gui.sliderFloat("Rotation Curve Blend##rs", p.ui.rotSmoothing or 0, 0, 1)
-			gmraTooltip("How strongly rotation keys are blended into one smooth camera turn.")
-			if Gui.collapsingHeader("Advanced Smoothing##advSmooth") then
+			Gui.setNextItemWidth(220)
+			p.ui.posSmoothing = Gui.sliderFloat("Extra Position Blend##ps", p.ui.posSmoothing or 0, 0, 1)
+			gmraTooltip("Adds more curve smoothing to the position path on top of Overall.")
+			Gui.setNextItemWidth(220)
+			p.ui.rotSmoothing = Gui.sliderFloat("Extra Rotation Blend##rs", p.ui.rotSmoothing or 0, 0, 1)
+			gmraTooltip("Adds more curve smoothing to the camera's turning on top of Overall.")
+			p.ui.useQuatInterp = Gui.checkbox("Smooth Rotation (Quaternion)##quat", p.ui.useQuatInterp == true)
+			gmraTooltip("On = smooth turning between rotation keys (recommended). Off = rotation holds each key.")
+			if Gui.collapsingHeader(gmraIcon("Wrench") .. " Advanced Smoothing##advSmooth") then
 				gmraIndentBlock()
 				p.ui.advancedSmoothing = Gui.checkbox(
 					"Enable Advanced Smoothing##advSmoothEnabled",
@@ -6787,13 +7772,34 @@ function onGuiImpl()
 				if not advEnabled then
 					Gui.beginDisabled()
 				end
-				Gui.separator() -- Position
+				gmraSectionLabel("Position")
+				Gui.setNextItemWidth(220)
 				p.ui.posOvershootGuard =
 					safeSliderFloat("Overshoot Guard##adv_posOvershootGuard", p.ui.posOvershootGuard or 0.4, 0, 1)
 				gmraTooltip(
 					"Prevents the position path from arcing too far away from your keys on sharp turns. Higher = tighter to keys."
 				)
-				Gui.separator() -- Rotation
+				Gui.setNextItemWidth(220)
+				p.ui.posTangentStrength =
+					safeSliderFloat("Tangent Strength##adv_posTangentStrength", p.ui.posTangentStrength or 1, 0, 1)
+				gmraTooltip("Overall strength of the position curve. Lower = flatter, closer to straight lines through keys.")
+				Gui.setNextItemWidth(220)
+				p.ui.posKeyflow = safeSliderFloat("Position Flow##adv_posKeyflow", p.ui.posKeyflow or 0.55, 0, 1)
+				gmraTooltip("How freely the path flows through keys. High = loose, sweeping curves. Low = tighter to each key.")
+				Gui.setNextItemWidth(220)
+				p.ui.posTimingCarry =
+					safeSliderFloat("Timing Carry##adv_posTimingCarry", p.ui.posTimingCarry or 1, 0, 1)
+				gmraTooltip("How much speed is carried through a key so uneven key spacing still feels like one continuous move.")
+				Gui.setNextItemWidth(220)
+				p.ui.posMidBiasPower =
+					safeSliderFloat("Mid Bias##adv_posMidBiasPower", p.ui.posMidBiasPower or 1, 0.25, 4)
+				gmraTooltip("Biases the curve's speed toward the middle of a segment. 1 = neutral, higher = more mid-segment glide.")
+				Gui.setNextItemWidth(220)
+				p.ui.posTangentClamp =
+					safeSliderFloat("Tangent Clamp##adv_posTangentClamp", p.ui.posTangentClamp or 2.5, 1, 5)
+				gmraTooltip("Caps how far the curve can overshoot on sharp turns. Higher = allows wider arcs, lower = reins them in.")
+				gmraSectionLabel("Rotation")
+				Gui.setNextItemWidth(220)
 				p.ui.rotKeyflow = safeSliderFloat("Rotation Flow##adv_rotKeyflow", p.ui.rotKeyflow or 0.85, 0, 1)
 				gmraTooltip(
 					"How freely the rotation flows through keys. High = loose and flowing. Low = tighter to each key."
@@ -6806,37 +7812,7 @@ function onGuiImpl()
 				gmraTooltip(
 					"Blends in straight slerp rotation. 0 = fully smooth Catmull-Rom arc. 1 = straight slerp between keys."
 				)
-				Gui.separator() -- Presets
-				if Gui.button("Flow Through##advPresetFlow") then
-					p.ui.globalSmoothing = 0.8
-					p.ui.posSmoothing = 0
-					p.ui.rotSmoothing = 0
-					p.ui.posOvershootGuard = 0.3
-					p.ui.rotKeyflow = 0.9
-					p.ui.rotLinearMix = 0
-					p.ui.rotSmoothStrength = 1
-				end
-				Gui.sameLine()
-				if Gui.button("Balanced##advPresetBalanced") then
-					p.ui.globalSmoothing = 0.6
-					p.ui.posSmoothing = 0
-					p.ui.rotSmoothing = 0
-					p.ui.posOvershootGuard = 0.4
-					p.ui.rotKeyflow = 0.75
-					p.ui.rotLinearMix = 0
-					p.ui.rotSmoothStrength = 1
-				end
-				Gui.sameLine()
-				if Gui.button("Soft Arc##advPresetSoft") then
-					p.ui.globalSmoothing = 0.5
-					p.ui.posSmoothing = 0
-					p.ui.rotSmoothing = 0
-					p.ui.posOvershootGuard = 0.55
-					p.ui.rotKeyflow = 0.6
-					p.ui.rotLinearMix = 0
-					p.ui.rotSmoothStrength = 1
-				end
-				Gui.separator() -- Custom Presets
+				gmraSectionLabel(gmraIcon("Save") .. " Custom Presets")
 				local presetNames = getSmoothingPresetNames()
 				local curPreset = smoothingPresetSelectedName
 				if curPreset == "" and (config.lastSmoothingPreset or "") ~= "" then
@@ -6894,12 +7870,22 @@ function onGuiImpl()
 				gmraUnindentBlock()
 			end
 			gmraUnindentBlock()
+			Gui.endTabItem()
 		end
-		Gui.separator() -- Timeline
-		gmraUnindentBlock()
+		if Gui.beginTabItem("Replays") then
+			gmraDrawReplaysSection(p)
+			Gui.endTabItem()
+		end
+		if Gui.beginTabItem("Settings") then
+			gmraDrawSettingsSection(p)
+			Gui.endTabItem()
+		end
+		if Gui.beginTabItem("Help") then
+			gmraDrawAboutSection()
+			Gui.endTabItem()
+		end
+		Gui.endTabBar()
 	end
-	gmraDrawReplaysSection(p)
-	gmraDrawSettingsSection(p)
 end
 function onGui()
 	local ok, err = pcall(onGuiImpl)
@@ -6926,8 +7912,22 @@ function gmraCrossesCut(keys, t0: number, t1: number): boolean
 	return false
 end
 function mainImpl()
-	if config.lastProject and config.lastProject ~= "" then
-		loadProjectByName(config.lastProject)
+	local target = config.lastProject
+	if type(target) ~= "string" or target == "" or not config.projects[target] then
+		-- Fall back to the most recently updated project.
+		local best = ""
+		local bestT = -1
+		for nm, pr in pairs(config.projects or {}) do
+			local t = tonumber(pr.updatedAt) or 0
+			if t >= bestT then
+				bestT = t
+				best = nm
+			end
+		end
+		target = best
+	end
+	if target ~= "" and config.projects[target] then
+		loadProjectByName(target)
 	end
 end
 function main()
@@ -6945,6 +7945,10 @@ function tickImpl(dt: number)
 	if p.tracks and p.tracks.timelineSpeed == p.tracks.speed then
 		p.tracks.timelineSpeed = cloneNumKeys(p.tracks.timelineSpeed)
 	end
+	if gmraExportActive then
+		gmraTickBlenderExport(p, dt)
+		return
+	end
 	gmraUpdateManualPOVOrbitInput(p, dt)
 	gmraUpdateKeyframeStepInput(p, dt)
 	if spacePressed() then
@@ -6961,6 +7965,11 @@ function tickImpl(dt: number)
 	end
 	if undoPressed() then
 		doUndo()
+	end
+	-- Debounced auto-save: persist ~2.5s after the last edit (no manual Save button).
+	if gmraDirty and (runtimeFrameCounter - gmraDirtyEditFrame) >= 150 then
+		safeSaveConfig()
+		gmraDirty = false
 	end
 	if animating then
 		local tlSpeed = evalNum(p.tracks.timelineSpeed, playhead)
@@ -7007,7 +8016,7 @@ function tickImpl(dt: number)
 		end
 	end
 	driveReplaysAtTime(p, playhead, dt)
-	local shouldPreviewView = previewEnabled and (animating or true)
+	local shouldPreviewView = previewEnabled
 	if shouldPreviewView then
 		camera:followCamera(nil)
 		mode = "Preview"
@@ -7039,6 +8048,10 @@ function tickImpl(dt: number)
 			camera.fieldOfViewSmoothing = 0
 			applyPOV(p, playhead)
 		end
+		postFxWasActive = true
+	elseif postFxWasActive then
+		gmraResetAppliedPostFx()
+		postFxWasActive = false
 	end
 	if previewEnabled then
 		WorldDraw.clear()
@@ -7053,4 +8066,21 @@ function tick(dt: number)
 			WorldDraw.clear()
 		end
 	end
+end
+function onUnload()
+	if postFxWasActive then
+		pcall(function()
+			gmraResetAppliedPostFx()
+		end)
+	end
+	pcall(stopLiveKeyEdit)
+	pcall(function()
+		camera.hideNearestHead = false
+	end)
+	pcall(function()
+		if WorldDraw and WorldDraw.clear then
+			WorldDraw.clear()
+		end
+	end)
+	postFxWasActive = false
 end
